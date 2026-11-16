@@ -1,0 +1,13 @@
+* text=auto
+tools/bones_seed_preprocessing/** text eol=lf
+*.sh text eol=lf
+*.sbatch text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.npz binary
+*.pt binary
+*.STL binary
+*.stl binary
+*.xml text eol=lf
+*.json text
+SHA256SUMS text eol=lf
