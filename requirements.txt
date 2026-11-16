@@ -26,6 +26,8 @@ ffmpeg-python
 scikit-image
 termcolor
 einops
+easydict==1.13
+yacs==0.1.8
 imageio==2.34.1
 av==13.0.0  # imageio[pyav], improved performance over imageio[ffmpeg]
 joblib

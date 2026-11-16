@@ -169,3 +169,14 @@ checkpoints/
 
 # Licensed or external inference assets
 inputs/checkpoints/
+
+# Team workspaces and external assets
+.venv*/
+.env.*
+!.env.example
+/third-party/
+/datasets/
+/data/raw/
+/data/processed/
+*.mp4
+*.mov

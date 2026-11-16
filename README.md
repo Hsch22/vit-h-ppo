@@ -1,3 +1,42 @@
+# ViT-H PPO team repository
+
+This repository starts from the released ViT-H offline video-to-G1 model.
+Our project objective is PPO post-training of the **motion generator**, using
+the existing fixed SONIC/MuJoCo tracker for execution feedback. The original
+implementation and attribution are preserved below.
+
+**Current status:** base training, video inference and tracker code are
+included. A PPO trainer is **not implemented** in this snapshot. The default
+DDIM sampler is deterministic conditional on its initial noise; defining a
+valid stochastic policy and its log-probabilities is part of the next stage.
+
+Start here:
+
+- [Deployment and external assets](docs/DEPLOYMENT.md)
+- [Pinned checkpoint download and verification](config/checkpoints.json):
+  `python scripts/checkpoints.py list`
+- [Architecture and PPO integration decisions](docs/PPO_INTEGRATION.md)
+- [Four-person workflow and handoffs](docs/TEAM_WORKFLOW.md)
+- [Checks actually performed and remaining limits](docs/VALIDATION.md)
+- [Source import provenance](docs/SOURCE_IMPORT.md)
+
+The unchanged import is tagged `base/vith-release-2482c5c`. Keep checkpoints,
+datasets, secrets and generated rollouts outside Git. Use small personal
+branches and pull requests for shared changes.
+
+```bash
+git clone https://github.com/Hsch22/vit-h-ppo.git
+cd vit-h-ppo
+```
+
+Follow the deployment guide before installing dependencies or downloading
+weights. Public read access does not grant push access; the repository owner
+must add teammates as collaborators if they will push branches directly.
+
+---
+
+## Original upstream README
+
 <div align="center">
 <h1 style="border-bottom: none; margin-bottom: 0px ">ViT-H: Generative Video-To-Humanoid Control with Motion Tracking Feedback</h1>
 

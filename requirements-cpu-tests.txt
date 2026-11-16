@@ -1,0 +1,10 @@
+# Isolated test environment only; not the CUDA inference environment.
+torch==2.3.0
+numpy==1.23.5
+av==13.0.0
+opencv-python-headless==4.10.0.84
+imageio==2.34.1
+omegaconf==2.3.0
+tqdm==4.67.1
+rich==13.9.4
+colorlog==6.9.0

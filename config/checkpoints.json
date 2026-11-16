@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "repo_id": "eerrr1/ViT-H-checkpoints",
+  "repo_type": "dataset",
+  "revision": "a6403aae1ce37fc15d26ee43d1cb16a728c5e44d",
+  "artifacts": [
+    {
+      "path": "inputs/checkpoints/dpvo/dpvo.pth",
+      "local_path": "inputs/checkpoints/dpvo/dpvo.pth",
+      "profile": "optional",
+      "size_bytes": 14167743,
+      "sha256": "30d02dc2b88a321cf99aad8e4ea1152a44d791b5b65bf95ad036922819c0ff12"
+    },
+    {
+      "path": "inputs/checkpoints/hmr2/epoch=10-step=25000.ckpt",
+      "local_path": "inputs/checkpoints/hmr2/epoch=10-step=25000.ckpt",
+      "profile": "optional",
+      "size_bytes": 2709494041,
+      "sha256": "2dcf79638109781d1ae5f5c44fee5f55bc83291c210653feead9b7f04fa6f20e"
+    },
+    {
+      "path": "inputs/checkpoints/vitpose/vitpose-h-multi-coco.pth",
+      "local_path": "inputs/checkpoints/vitpose/vitpose-h-multi-coco.pth",
+      "profile": "base",
+      "size_bytes": 2549075546,
+      "sha256": "50e33f4077ef2a6bcfd7110c58742b24c5859b7798fb0eedd6d2215e0a8980bc"
+    },
+    {
+      "path": "inputs/checkpoints/yolo/yolov8x.pt",
+      "local_path": "inputs/checkpoints/yolo/yolov8x.pt",
+      "profile": "base",
+      "size_bytes": 136867539,
+      "sha256": "c4d5a3f000d771762f03fc8b57ebd0aae324aeaefdd6e68492a9c4470f2d1e8b"
+    },
+    {
+      "path": "model_step_020000_g1.onnx",
+      "local_path": "inputs/checkpoints/g1_tracker/model_step_020000_g1.onnx",
+      "profile": "tracker",
+      "size_bytes": 58053634,
+      "sha256": "da875c31057e4d5f0e0b3ba30722c506fb3a9fa3e030998069b5ded3ac38403b"
+    },
+    {
+      "path": "vith_offline_g1.ckpt",
+      "local_path": "vith_offline_g1.ckpt",
+      "profile": "base",
+      "size_bytes": 878398360,
+      "sha256": "aca7e1f77ee875a974821f6dcf03c1359f823ab2669ee7efe1a2ed22690886a2"
+    }
+  ]
+}
