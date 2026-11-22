@@ -291,6 +291,50 @@ class WindowAlignmentTests(unittest.TestCase):
             atol=1e-5,
         )
 
+    def test_infer_video_multi_frame_overlap_yaw_cosine_recomputes_fk(self):
+        from post_training.stitching import chunk_windows
+        from tools.infer_video import infer_video
+
+        class _Endecoder:
+            def __init__(self):
+                self.fk_calls = 0
+
+            def fk_g1(self, jp, rp, rq, world_up="y"):
+                self.fk_calls += 1
+                assert world_up == "y"
+                return rp[:, :, None, :].expand(-1, -1, 30, -1).clone(), None
+
+        class _Pipeline:
+            def __init__(self):
+                self.calls = 0
+                self.endecoder = _Endecoder()
+
+            def forward(self, batch, train=False):
+                del train
+                length = batch["obs"].shape[1]
+                jp = torch.full((1, length, 29), 0.0 if self.calls == 0 else 0.12)
+                rp = torch.zeros(1, length, 3)
+                rq = torch.tensor([[[1.0, 0.0, 0.0, 0.0]]]).expand(1, length, 4).clone()
+                bp = torch.zeros(1, length, 30, 3)
+                self.calls += 1
+                return {
+                    "pred_g1_joint_pos": jp,
+                    "pred_root_pos": rp,
+                    "pred_root_quat_w": rq,
+                    "pred_g1_body_pos_w": bp,
+                }
+
+        total_len = 224
+        prep = self._prep(total_len, 120)
+        prep["chunks_meta"] = chunk_windows(total_len, window=120, overlap=16)
+        pipe = _Pipeline()
+        result = infer_video(pipe, prep, total_len, device="cpu", align_mode="yaw", blend_mode="cosine")
+        self.assertEqual(pipe.endecoder.fk_calls, 1)
+        self.assertEqual(result["joint_pos"].shape, (total_len, 29))
+        self.assertEqual(result["body_pos_w"].shape, (total_len, 30, 3))
+        max_step = float(np.max(np.mean(np.abs(np.diff(result["joint_pos"], axis=0)), axis=-1)))
+        self.assertLess(max_step, 0.015)  # 0.12 rad jump smoothed > 8x
+
 
 if __name__ == "__main__":
     unittest.main()

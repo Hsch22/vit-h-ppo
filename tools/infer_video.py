@@ -70,6 +70,24 @@ def parse_args():
     parser.add_argument("--sam3d-img-ds", type=float, default=1.0)
     parser.add_argument("--sam3d-batch-size", type=int, default=16)
     parser.add_argument("--window", type=int, default=120)
+    parser.add_argument(
+        "--overlap",
+        type=int,
+        default=16,
+        help="Overlap frames between adjacent windows (1=legacy hard stitch, 16=recommended cosine/SLERP blend).",
+    )
+    parser.add_argument(
+        "--align-mode",
+        choices=("yaw", "so3"),
+        default="yaw",
+        help="Inter-window rigid alignment mode ('yaw' preserves gravity-view vertical axis; 'so3' matches legacy 3D align).",
+    )
+    parser.add_argument(
+        "--blend-mode",
+        choices=("cosine", "linear"),
+        default="cosine",
+        help="Overlap blending schedule when --overlap > 1.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -153,12 +171,13 @@ def add_video_camera_data(data, cfg):
     data["image_wh"] = np.asarray([width, height], dtype=np.int32)
 
 
-def make_prep_from_video_data(data, window, device):
+def make_prep_from_video_data(data, window, device, overlap=1):
     """Convert original VITH demo data dict into G1 pipeline inference tensors."""
     import torch
 
     from hmr4d.model.offline.utils.obs_joints import select_coco17_no_nose_ears
     from hmr4d.utils.geo.hmr_cam import normalize_kp2d
+    from post_training.stitching import chunk_windows
 
     length = int(data["length"].item() if torch.is_tensor(data["length"]) else data["length"])
 
@@ -172,17 +191,12 @@ def make_prep_from_video_data(data, window, device):
         "cam_angvel_full": data["cam_angvel"].to(dtype=torch.float32).cpu(),
         "f_imgseq_full": data["f_imgseq"].to(dtype=torch.float32).cpu(),
         "window": int(window),
+        "overlap": int(overlap),
         "total_len": length,
     }
-    if length <= window:
-        chunks_meta = [(0, length)]
-    else:
-        starts = [0]
-        while starts[-1] + window < length:
-            starts.append(starts[-1] + window - 1)
-        chunks_meta = [(s, min(window, length - s)) for s in starts]
+    chunks_meta = chunk_windows(length, window=int(window), overlap=int(overlap))
     prep["chunks_meta"] = chunks_meta
-    print(f"[Info] Video length={length}, {len(chunks_meta)} chunks (window={window}, overlap=1)")
+    print(f"[Info] Video length={length}, {len(chunks_meta)} chunks (window={window}, overlap={overlap})")
     return prep, length
 
 
@@ -220,13 +234,22 @@ def align_window_to_previous(
     return aligned_root_pos, aligned_root_quat, aligned_body_pos
 
 
-def infer_video(pipeline, prep, total_len, device="cuda", singular_rewrite="none"):
+def infer_video(
+    pipeline,
+    prep,
+    total_len,
+    device="cuda",
+    singular_rewrite="none",
+    align_mode="so3",
+    blend_mode="cosine",
+):
     import torch
     import torch.nn.functional as F
     from motion_lib.motion_utils.rotation_conversions import (
         matrix_to_quaternion,
         quaternion_to_matrix,
     )
+    from post_training.stitching import stitch_sequence_yup
     from tools.inference_utils import reduce_singular_chains
 
     obs_full = prep["obs_full"]
@@ -244,33 +267,25 @@ def infer_video(pipeline, prep, total_len, device="cuda", singular_rewrite="none
             f"network attention max_len remains {prep.get('trained_max_len', 120)}"
         )
 
-    joint_pos_out = torch.zeros(total_len, 29, device=device)
-    root_pos_out = torch.zeros(total_len, 3, device=device)
-    root_quat_out = torch.zeros(total_len, 4, device=device)
-    body_pos_out = None
-
     def pad_window(x, pad_len):
         if pad_len <= 0:
             return x
         return torch.cat([x, x[-1:].expand(pad_len, *x.shape[1:])], dim=0)
 
-    prev_last_pos = None
-    prev_last_quat = None
+    n_chunks = len(chunks_meta)
+    jp_chunks = torch.zeros(n_chunks, window, 29, device=device)
+    rp_chunks = torch.zeros(n_chunks, window, 3, device=device)
+    rq_chunks = torch.zeros(n_chunks, window, 4, device=device)
+    bp_chunks = None
 
     for chunk_idx, (start, actual_len) in enumerate(chunks_meta):
         end = start + actual_len
         pad_len = window - actual_len
-        obs = pad_window(obs_full[start:end], pad_len)
-        bbx_xys = pad_window(bbx_xys_full[start:end], pad_len)
-        K_fullimg = pad_window(K_fullimg_full[start:end], pad_len)
-        cam_angvel = pad_window(cam_angvel_full[start:end], pad_len)
-        f_imgseq = pad_window(f_imgseq_full[start:end], pad_len)
-
-        obs = obs.to(device)
-        bbx_xys = bbx_xys.to(device)
-        K_fullimg = K_fullimg.to(device)
-        cam_angvel = cam_angvel.to(device)
-        f_imgseq = f_imgseq.to(device)
+        obs = pad_window(obs_full[start:end], pad_len).to(device)
+        bbx_xys = pad_window(bbx_xys_full[start:end], pad_len).to(device)
+        K_fullimg = pad_window(K_fullimg_full[start:end], pad_len).to(device)
+        cam_angvel = pad_window(cam_angvel_full[start:end], pad_len).to(device)
+        f_imgseq = pad_window(f_imgseq_full[start:end], pad_len).to(device)
 
         batch = {
             "length": torch.tensor([actual_len], device=device, dtype=torch.long),
@@ -280,44 +295,42 @@ def infer_video(pipeline, prep, total_len, device="cuda", singular_rewrite="none
             "cam_angvel": cam_angvel.unsqueeze(0),
             "f_imgseq": f_imgseq.unsqueeze(0),
         }
-        if prev_last_pos is not None:
-            g1_body_pos_w = torch.zeros(1, 1, 1, 3, device=device, dtype=prev_last_pos.dtype)
-            g1_body_pos_w[0, 0, 0] = prev_last_pos
-            batch["g1_target"] = {"g1_body_pos_w": g1_body_pos_w}
 
         outputs = pipeline.forward(batch, train=False)
-        pred_jp = outputs["pred_g1_joint_pos"][0, :actual_len]
-        pred_rp = outputs["pred_root_pos"][0, :actual_len]
-        pred_rq = outputs["pred_root_quat_w"][0, :actual_len]
+        jp_chunks[chunk_idx, :actual_len] = outputs["pred_g1_joint_pos"][0, :actual_len]
+        rp_chunks[chunk_idx, :actual_len] = outputs["pred_root_pos"][0, :actual_len]
+        rq_chunks[chunk_idx, :actual_len] = outputs["pred_root_quat_w"][0, :actual_len]
         pred_body = outputs.get("pred_g1_body_pos_w")
         if pred_body is not None:
             pred_body = pred_body[0, :actual_len]
-            if body_pos_out is None:
-                body_pos_out = torch.zeros(total_len, pred_body.shape[1], 3, device=device)
+            if bp_chunks is None:
+                bp_chunks = torch.zeros(n_chunks, window, pred_body.shape[1], 3, device=device)
+            bp_chunks[chunk_idx, :actual_len] = pred_body
 
-        if prev_last_quat is not None:
-            pred_rp, pred_rq, pred_body = align_window_to_previous(
-                pred_rp,
-                pred_rq,
-                pred_body,
-                prev_last_pos,
-                prev_last_quat,
-            )
+    has_body = bp_chunks is not None
+    bp_in = bp_chunks if has_body else torch.zeros(n_chunks, window, 1, 3, device=device)
+    fk_fn = None
+    if has_body and hasattr(pipeline, "endecoder") and hasattr(pipeline.endecoder, "fk_g1"):
+        def _fk_g1_single(jp, rp, rq):
+            bp, _ = pipeline.endecoder.fk_g1(jp.unsqueeze(0), rp.unsqueeze(0), rq.unsqueeze(0), world_up="y")
+            return bp[0]
+        fk_fn = _fk_g1_single
 
-        if chunk_idx == 0:
-            write_slice = slice(start, end)
-            src_slice = slice(0, actual_len)
-        else:
-            write_slice = slice(start + 1, end)
-            src_slice = slice(1, actual_len)
-        joint_pos_out[write_slice] = pred_jp[src_slice]
-        root_pos_out[write_slice] = pred_rp[src_slice]
-        root_quat_out[write_slice] = pred_rq[src_slice]
-        if body_pos_out is not None and pred_body is not None:
-            body_pos_out[write_slice] = pred_body[src_slice]
-
-        prev_last_pos = pred_rp[actual_len - 1].detach()
-        prev_last_quat = pred_rq[actual_len - 1].detach()
+    stitched = stitch_sequence_yup(
+        jp_c=jp_chunks,
+        rp_c=rp_chunks,
+        rq_c=rq_chunks,
+        bp_c=bp_in,
+        chunks_meta=chunks_meta,
+        total_len=total_len,
+        align_mode=align_mode,
+        blend_mode=blend_mode,
+        fk_fn=fk_fn,
+    )
+    joint_pos_out = stitched["joint_pos"]
+    root_pos_out = stitched["root_pos_w"]
+    root_quat_out = stitched["root_quat_w"]
+    body_pos_out = stitched["body_pos_w"] if has_body else None
 
     # Match infer_amass2g1.py output convention: convert internal y-up frame to G1 z-up URDF world.
     M_pos = torch.tensor(
@@ -363,6 +376,8 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
     if args.window != 120:
         raise ValueError("This release was trained with a 120-frame window; use --window 120.")
+    if args.overlap < 1 or args.overlap >= args.window:
+        raise ValueError(f"--overlap must satisfy 1 <= overlap < window ({args.window}), got {args.overlap}.")
 
     required_encoder, encoder_provenance = inspect_checkpoint_imgfeat_encoder(args.ckpt)
     args.imgfeat_encoder = resolve_imgfeat_encoder(
@@ -397,6 +412,7 @@ def main():
         data,
         window=args.window,
         device=args.device,
+        overlap=args.overlap,
     )
     pipeline = load_pipeline(
         args.ckpt,
@@ -416,6 +432,8 @@ def main():
             total_len,
             device=args.device,
             singular_rewrite=args.singular_rewrite,
+            align_mode=args.align_mode,
+            blend_mode=args.blend_mode,
         )
 
     required_lengths = {
@@ -452,6 +470,9 @@ def main():
         model_num_heads=np.array(args.model_num_heads, dtype=np.int32),
         fps=np.array(float(cfg.target_fps), dtype=np.float32),
         source_name=data["source_name"],
+        stitch_overlap=np.array(int(args.overlap), dtype=np.int32),
+        stitch_align_mode=args.align_mode,
+        stitch_blend_mode=args.blend_mode,
     )
     print(f"Saved: {output}")
     print(f"joint_pos: {results['joint_pos'].shape}")
