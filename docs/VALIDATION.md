@@ -233,6 +233,32 @@ Key empirical observations:
   max `924f`) and `h36m` (`100% >= 596f`, max `1,901f`) contain substantial
   multi-window long-horizon trajectories where stitched drift can also be tested.
 
+### Long-horizon multi-window stitched evaluation (`test`, `>= 240` frames, `n = 383`)
+
+Evaluated via `post_training/eval_long_horizon.py` using the exact 1-frame
+overlap rigid endpoint stitching from `tools/infer_video.py::align_window_to_previous`
+(DDIM-50 `eta=0.0`, identical per-chunk noise seeds, frozen Protocol v4 tracker)
+across all `383` `test` sequences with `length >= 240` (`367 bedlam2` + `16 h36m`):
+
+| Slice (`n`) | GT `g1_new` pass | Base pass (`\|GT pass`) | PPO-500 pass (`\|GT pass`) | Paired Base vs PPO-500 | Base vs PPO-500 `exec_root_err` | Base seam jump vs interior |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| **Overall (`383`)** | 93.47% (25 fail) | 87.47% (89.66%) | **88.25%** (90.22%) | +5 fixed / -2 regressed (`p=0.45`) | `0.2710 -> 0.2629 m` | `0.0839` vs `0.0138 rad` (**6.1x**) |
+| `240–359f` 8–12s (`133`) | 91.73% | 90.23% (91.80%) | 89.47% (90.98%) | +0 / -1 (`p=1.0`) | `0.1984 -> 0.2011 m` | `0.0858` vs `0.0149 rad` (5.7x) |
+| `360–599f` 12–20s (`233`) | 96.57% | 89.70% (90.67%) | **90.56%** (91.11%) | +3 / -1 (`p=0.63`) | `0.2325 -> 0.2305 m` | `0.0829` vs `0.0130 rad` (6.4x) |
+| `600+f` 20–76s (`17`) | 64.71% | 35.29% (45.45%) | **47.06%** (**63.64%**) | +2 / -0 (`p=0.50`) | `1.3659 -> 1.1903 m` | `0.0840` vs `0.0154 rad` (5.5x) |
+
+Key empirical findings:
+- Unlike 120-frame single windows (`99.2%` Base pass given GT pass), long-horizon
+  stitched Base pass rate drops to `87.47%` overall (`89.7%` on 12–20s, `35.3%`
+  on 20–76s H36M sequences) while GT remains much higher (`96.6%` on 12–20s,
+  `64.7%` on 20–76s).
+- Window boundaries exhibit a **6.1x joint-angle discontinuity** (`0.0839 rad` at
+  stitch seams vs `0.0138 rad` interior step), and **27% (`13/48`)** of Base
+  failures occur within `<= 0.5s` of a seam vs only **4% (`1/25`)** for GT.
+- Even the conservatively updated 500-step pilot (`0.109%` weight shift) showed
+  consistent positive direction on long sequences (`+5/-2` overall, `+2/-0` on
+  `600+f`, `exec_root_err` `-8.1 mm` overall and `-176 mm` on `600+f`).
+
 ### Remaining open research questions
 
 - Uniform in-domain 120-frame sampling saturates near 98.6% Base success and
