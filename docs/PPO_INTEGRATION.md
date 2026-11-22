@@ -2,18 +2,19 @@
 
 ## Scope and current status
 
-The project will post-train the pretrained video-to-G1 motion generator with
-PPO using feedback from a fixed motion tracker. This is a development plan,
-not a runnable PPO implementation. The imported release provides supervised
-diffusion training, inference, and a MuJoCo tracker. It does not provide a PPO
-trainer, PPO rollout buffer, policy likelihood adapter, critic, or reward
-definition. The upstream release checklist also marks post-training code as
-unreleased.
+The project post-trains the pretrained video-to-G1 motion generator with
+Diffusion-PPO (`ddpo_group_v1`) using feedback from a fixed SONIC ONNX +
+MuJoCo tracker. The imported release (`base/vith-release-2482c5c`) provides
+supervised diffusion training, inference, and the MuJoCo tracker; the
+`post_training/` package adds the stochastic DDIM policy adapter,
+differentiable likelihood replay, analytic KL regularization, persistent
+cross-environment tracker pool, versioned execution+fidelity reward, and
+single/multi-GPU DDP PPO trainer.
 
-The immutable import is tagged `base/vith-release-2482c5c`. Keep a frozen copy
-of the base generator for evaluation and for any explicitly selected
-regularization objective. The low-level SONIC policy is not the model being
-post-trained.
+The immutable import is tagged `base/vith-release-2482c5c`. A frozen copy of
+the base generator (`base_denoiser`) is retained for held-out evaluation and
+analytic KL regularization. The low-level SONIC ONNX policy, MuJoCo XMLs,
+grounding, and Protocol v4 evaluation are strictly frozen.
 
 ## Verified base model
 
@@ -157,6 +158,79 @@ See [success implementation](../g1_tracker/vith_tracker/success.py#L17) and
 These fields are observations, not an established PPO reward. They also do
 not establish equivalence to previously reported Push Success or Long
 Success protocols; those require their own documented experiments.
+
+## Implemented PPO design (`ddpo_group_v1` / `reward_v1`)
+
+All seven design items above are resolved explicitly in `post_training/`:
+
+1. **Policy and episode (`post_training/policy.py`, `post_training/dataset.py`).**
+   Each PPO episode is a single video-conditioned 120-frame motion window
+   (`h36m`, `bedlam`, `bedlam2`, defaulting to `g1_new.pth` targets with
+   strict source-level `train`/`val`/`test` splits). PPO acts on the reverse
+   diffusion denoising chain $x_T \to \dots \to x_0$ in normalized 189-D
+   motion space. Terminal motion $x_0$ is decoded via `decode_x0_to_g1_zup()`
+   (matching `tools/infer_video.py` Y-up to Z-up conversion) and evaluated
+   by the frozen MuJoCo/SONIC tracker at each clip's native FPS.
+
+2. **Stochastic sampler and likelihood (`post_training/policy.py`).**
+   `StochasticDDIMPolicy` enforces `0 < eta <= 1.0` (default `ddim_steps=20`,
+   `eta=0.7`) and rejects `eta <= 0`. Only transitions with strictly positive
+   variance (`t_idx > 0`, `sigma_k > 0`) contribute to policy log-probability
+   and KL; the final deterministic projection step (`t_idx == 0`, `sigma == 0`)
+   is explicitly excluded from density terms.
+
+3. **Likelihood replay (`post_training/policy.py`, `post_training/train_ppo.py`).**
+   Rollout records `(x_t, x_prev, t_indices, old_log_probs, base_means, valid_mask)`.
+   Both rollout and differentiable `replay_step()` execute `denoiser` in
+   `eval()` mode (deterministic dropout) with identical conditioning and
+   per-element mean Gaussian log-probability over valid `(frame, 189)`
+   dimensions. Before the first optimizer update, `train_ppo.py` executes a
+   mandatory replay self-check requiring `max|new_logp - old_logp| <= 5e-3`
+   and `max|ratio - 1| <= 5e-3`.
+
+4. **Value and advantage (`post_training/reward.py`).**
+   No separate learned critic head is introduced. Instead, each video clip
+   prompt samples `K = group_size` (default `4`) stochastic trajectories and
+   computes group-normalized advantages (DDPO-Group / GRPO):
+   `A_{i,k} = clip((r_{i,k} - mean_i) / (std_i + 1e-4), -5, 5)`, setting
+   zero-variance groups (`std_i <= 1e-6`) cleanly to `0`.
+
+5. **Reward and fidelity (`post_training/reward.py`).**
+   Versioned as `reward_v1`:
+   `r = w_success * 1[is_success] + w_survival * survival_ratio + w_exec_track * exp(-e_j/0.25)*exp(-e_r/0.25) + w_fidelity * (0.5*exp(-j_mae/0.30) + 0.5*exp(-b_mpjpe/0.20))`
+   with default weights `(1.0, 0.5, 0.3, 1.0)`. Fidelity compares generated
+   joints and root-relative 30-body positions against the clip's Z-up
+   reference trajectory (`g1_new.pth`), preventing stationary collapse.
+   Non-finite predictions or tracker errors receive an explicit
+   `invalid_penalty = -1.0` and are never treated as successes or silently
+   dropped. Held-out `val` splits are evaluated separately at step 0 and
+   every `--eval-every` steps.
+
+6. **KL and update scope (`post_training/train_ppo.py`).**
+   Only `pipeline.denoiser3d` parameters are trainable (`requires_grad=True`);
+   `cond_embedder`, `endecoder`, `base_denoiser`, and the SONIC tracker
+   remain frozen. Regularization uses exact closed-form Gaussian KL
+   `KL(N(mu_policy, sigma_k^2) || N(mu_base, sigma_k^2))` averaged over valid
+   `(frame, 189)` elements against the frozen `base_denoiser` (`--kl-coef 0.04`).
+   Optimization uses fused `AdamW` (`lr=1e-5`), clipped PPO surrogate
+   (`clip_eps=0.2`), `ppo_epochs=2`, and gradient clipping (`1.0`).
+
+7. **Reproducibility and compatibility (`post_training/train_ppo.py`).**
+   Every checkpoint writes `ppo_step`, `policy_version`, `reward_version`,
+   `imgfeat_encoder="sam3d"`, full `pipeline.*`-prefixed `model_state_dict`
+   (strictly loadable by `tools/inference_utils.py::load_pipeline()`),
+   `denoiser_state_dict`, `optimizer_state_dict`, RNG states, CLI `config`,
+   and `provenance` (Git commit, base checkpoint SHA-256, tracker ONNX
+   SHA-256, XML paths, sources, `g1_pth_name`, and split counts).
+
+### Persistent cross-environment tracker pool (`post_training/tracker_pool.py`)
+
+Because `vith-base` (PyTorch/CUDA) and `vith-tracker` (MuJoCo + ONNX Runtime)
+are isolated environments, `PersistentTrackerPool` maintains long-lived
+`post_training/tracker_worker.py` subprocesses inside `vith-tracker` that
+load `DeployPolicy`, `DeployRolloutRunner`, and `InitialSupportGrounder`
+once and exchange binary length-prefixed payloads over stdin/stdout pipes
+with zero disk I/O and zero per-step process spawn.
 
 ## Integration milestones
 

@@ -122,10 +122,51 @@ and the `sam_3d_body` runtime packages) resolved the import cleanly with
 | ViT-H 50-step DDIM GPU forward | Strict `load_pipeline` loaded in 5.62s; 120-frame 50-step DDIM forward ran in 0.77s with 0.91 GiB peak VRAM and finite outputs. |
 | Real-video end-to-end inference + tracking | 300-frame (10.0s @ 30 FPS, 960x540, 3 chunks) real human dancing video completed `tools/infer_video.py` (YOLO + ViTPose + Fast-SAM3D + SimpleVO + ViT-H) in 53s and `g1_tracker/tools/track_g1.py` in 4s. All reference and tracked arrays were finite; tracker Protocol v4 reported `is_success=[true]`, `first_failure_frame_50hz=[-1]`, `grounding_offset_m=[0.00566]`, `initial_joint_clip_count=[0]`. |
 
-### Still not implemented or verified
+### Hopper (`sm_90`) bottleneck profiling & optimization
 
-- PPO policy density, critic, rollout buffer, reward, KL control, and training
-  are not yet implemented (`docs/PPO_INTEGRATION.md`).
-- Full multi-clip base evaluation, training-set staging, and multi-GPU
-  supervised/PPO training throughput remain to be run once the training dataset
-  is staged.
+Profiling `RelativeTransformer` (`L=120, D=1024, 16 layers, 16 heads`) on H100
+via `torch.profiler` showed baseline FP32 spent ~78% of CUDA time in SIMT/Ampere
+FP32 GEMMs, while naive BF16 autocast regressed (`82.82 ms` vs `67.63 ms` TF32)
+due to `@autocast(enabled=False)` FP32 casts inside `rotary_embedding.py` and
+manual `einops.einsum` attention in `encoder_rope.py`. Replacing attention with
+`F.scaled_dot_product_attention`, pre-caching non-persistent RoPE `cos`/`sin`
+tables, adding mask-free `all_valid_length` FlashAttention dispatch, and
+enabling Hopper BF16 + `torch.compile` yielded:
+
+| Workload (`B=32, L=120` on H100 80GB) | FP32 baseline | SDPA + CachedRoPE + BF16 | + `torch.compile` | Speedup |
+| --- | --- | --- | --- | --- |
+| 50-step DDIM rollout | 2193.3 ms | 566.3 ms (3.87x) | **240.6 ms** (`reduce-overhead`) | **9.11x** |
+| Training fwd + bwd | 130.28 ms | 50.68 ms (2.57x) | **37.99 ms** (`default`) | **3.43x** |
+
+Numerical parity vs the original manual `einsum` attention was verified at
+`max_abs = 2.82e-04`, `max_rel = 2.59e-06` (and `< 1e-5` in FP32 unit tests).
+
+For tracker feedback during PPO, `PersistentTrackerPool` eliminates per-step
+subprocess startup and disk I/O while preserving exact Protocol v4 parity
+(`off_diff = 7.61e-11` m on the 300-frame dancing reference):
+
+| `PersistentTrackerPool` workers (16 x 120f batch) | Init | Batch latency | Throughput |
+| --- | --- | --- | --- |
+| 4 workers | 1.61 s | 3.734 s | 4.3 traj/s |
+| 8 workers | 1.07 s | 2.267 s | 7.1 traj/s |
+| 16 workers | 1.10 s | 1.328 s | 12.0 traj/s |
+
+### 2-GPU Diffusion-PPO end-to-end smoke verification (`h36m`, `g1_new.pth`)
+
+Verified with `torchrun --standalone --nproc_per_node=2 post_training/train_ppo.py`
+(`prompts_per_rank=4`, `group_size=4`, `ddim_steps=20`, `ddim_eta=0.7`,
+`ppo_epochs=2`, `update_steps_per_epoch=10`, `--compile-rollout --compile-mode reduce-overhead`,
+`--tracker-workers 8`, and live SwanLab logging):
+
+| Check | Observed result |
+| --- | --- |
+| Unit tests (`tests/`) | 46/46 passed (including 6 new PPO policy/reward/SDPA tests in `tests/test_ppo_components.py`). |
+| Baseline held-out validation (`step=0`) | `val/success_rate=0.875`, `val/survival_ratio=0.9817`, `val/exec_track=0.4040`, `val/fidelity=0.2625`, `val/invalid_rate=0.0`. |
+| Old-policy likelihood replay self-check | `max|new_logp - old_logp| = 5.01e-06`, `max|ratio - 1| = 5.01e-06`, `init_kl = 6.13e-08` (pre-resume) and `6.32e-06` (post-resume). |
+| Steady-state 2-GPU PPO step timing | `roll=0.17s` (compiled BF16 CUDA-graph rollout), `trk=2.49s` (persistent tracker pool), `upd=1.40s` (DDP + fused `AdamW`), finite losses/gradients (`ratio≈0.989`, `clip≈0.02`, `kl≈0.034`, `gnorm≈1.46–3.98`). |
+| Checkpoint save/resume + strict `load_pipeline` | Resumed from `ppo_step_00003.pt` through step 5; `inspect_checkpoint_imgfeat_encoder` returned `'sam3d'`; `load_pipeline` strict load succeeded; parameter deltas confirmed `denoiser3d=9.374e-05` (>0) while `fixed_pe=0.0`, `aux_head=0.0`, and `cond_embedder=0.0`. |
+
+### Remaining long-horizon evaluation
+
+- Full multi-source (`h36m + bedlam + bedlam2`) 8-GPU DDP PPO convergence and
+  held-out base-vs-PPO comparison across full evaluation splits.

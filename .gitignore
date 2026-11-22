@@ -137,6 +137,7 @@ outputs/
 logs/
 train_logs/
 wandb/
+swanlog/
 lightning_logs/
 multirun/
 tmp/
