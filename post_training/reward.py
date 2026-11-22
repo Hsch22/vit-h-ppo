@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from post_training import REWARD_VERSION, REWARD_VERSION_V2
+from post_training import REWARD_VERSION, REWARD_VERSION_V2, REWARD_VERSION_V3
 
 
 @dataclass(frozen=True)
@@ -19,14 +19,16 @@ class RewardWeights:
     w_survival: float = 0.5
     # reward_v1 combined execution term
     w_exec_track: float = 0.3
-    # reward_v2 decomposed execution & velocity-preservation terms
+    # reward_v2 / reward_v3 decomposed execution, seam & velocity-preservation terms
     w_exec_root: float = 1.2
     w_exec_joint: float = 0.8
+    w_seam: float = 0.0
     w_fidelity: float = 1.0
     w_vel_fidelity: float = 0.0
     invalid_penalty: float = -1.0
     exec_joint_scale: float = 0.25
     exec_root_scale: float = 0.25
+    seam_scale: float = 0.05
     fid_joint_scale: float = 0.30
     fid_body_scale: float = 0.20
     vel_fid_scale: float = 0.30
@@ -58,6 +60,35 @@ def make_reward_weights_v2(
     )
 
 
+def make_reward_weights_v3(
+    w_success: float = 1.0,
+    w_survival: float = 0.6,
+    w_exec_root: float = 1.2,
+    w_exec_joint: float = 0.8,
+    w_seam: float = 0.8,
+    w_fidelity: float = 0.4,
+    w_vel_fidelity: float = 0.5,
+) -> RewardWeights:
+    """Long-horizon stitched reward_v3: adds explicit seam consistency + stronger velocity preservation."""
+    return RewardWeights(
+        version=REWARD_VERSION_V3,
+        w_success=w_success,
+        w_survival=w_survival,
+        w_exec_track=0.0,
+        w_exec_root=w_exec_root,
+        w_exec_joint=w_exec_joint,
+        w_seam=w_seam,
+        w_fidelity=w_fidelity,
+        w_vel_fidelity=w_vel_fidelity,
+        exec_joint_scale=0.15,
+        exec_root_scale=0.20,
+        seam_scale=0.05,
+        fid_joint_scale=0.30,
+        fid_body_scale=0.20,
+        vel_fid_scale=0.30,
+    )
+
+
 def compute_sample_rewards(
     tracker_results: list[dict[str, Any]],
     pred_joint_pos: np.ndarray,
@@ -67,14 +98,16 @@ def compute_sample_rewards(
     lengths: np.ndarray,
     weights: RewardWeights = RewardWeights(),
     fps: np.ndarray | float = 30.0,
+    seam_overlap_err: np.ndarray | None = None,
+    seam_joint_jump: np.ndarray | None = None,
+    interior_joint_step: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Combine frozen SONIC tracker execution feedback with reference fidelity.
 
-    Supports both `reward_v1` (combined `w_exec_track`) and `reward_v2`
-    (separate sharper `w_exec_root`, `w_exec_joint`, plus `w_vel_fidelity`
-    to prevent joint-velocity smoothing).
+    Supports `reward_v1`, `reward_v2`, and `reward_v3` (stitched long-horizon
+    reward with explicit boundary seam consistency).
     """
-    if weights.version not in (REWARD_VERSION, REWARD_VERSION_V2):
+    if weights.version not in (REWARD_VERSION, REWARD_VERSION_V2, REWARD_VERSION_V3):
         raise ValueError(f"Unsupported reward version: {weights.version!r}")
 
     n = len(tracker_results)
@@ -90,6 +123,7 @@ def compute_sample_rewards(
     exec_root_err = np.full(n, np.nan, dtype=np.float32)
     fidelity = np.zeros(n, dtype=np.float32)
     vel_fidelity = np.zeros(n, dtype=np.float32)
+    seam_score = np.ones(n, dtype=np.float32)
     mean_joint_vel = np.full(n, np.nan, dtype=np.float32)
     ref_joint_mae = np.full(n, np.nan, dtype=np.float32)
     ref_body_mpjpe = np.full(n, np.nan, dtype=np.float32)
@@ -161,12 +195,30 @@ def compute_sample_rewards(
                 + weights.w_exec_track * r_trk
                 + weights.w_fidelity * r_fid
             )
-        else:
+        elif weights.version == REWARD_VERSION_V2:
             rewards[i] = (
                 weights.w_success * (1.0 if succ else 0.0)
                 + weights.w_survival * surv
                 + weights.w_exec_root * r_er
                 + weights.w_exec_joint * r_ej
+                + weights.w_fidelity * r_fid
+                + weights.w_vel_fidelity * r_vfid
+            )
+        else:
+            if seam_overlap_err is not None and seam_joint_jump is not None and interior_joint_step is not None:
+                ov_err = max(0.0, float(seam_overlap_err[i]))
+                excess = max(0.0, float(seam_joint_jump[i]) - float(interior_joint_step[i]))
+                s_err = 0.5 * ov_err + 0.5 * excess
+                r_seam = math.exp(-s_err / weights.seam_scale)
+            else:
+                r_seam = 1.0
+            seam_score[i] = r_seam
+            rewards[i] = (
+                weights.w_success * (1.0 if succ else 0.0)
+                + weights.w_survival * surv
+                + weights.w_exec_root * r_er
+                + weights.w_exec_joint * r_ej
+                + weights.w_seam * r_seam
                 + weights.w_fidelity * r_fid
                 + weights.w_vel_fidelity * r_vfid
             )
@@ -181,6 +233,7 @@ def compute_sample_rewards(
         "exec_joint_score": exec_joint_score,
         "exec_joint_mae_rad": exec_joint_mae,
         "exec_root_pos_err_m": exec_root_err,
+        "seam_score": seam_score,
         "fidelity": fidelity,
         "vel_fidelity": vel_fidelity,
         "mean_joint_vel_rad_s": mean_joint_vel,

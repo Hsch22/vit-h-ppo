@@ -15,7 +15,9 @@ from post_training.reward import (
     compute_group_advantages,
     compute_sample_rewards,
     make_reward_weights_v2,
+    make_reward_weights_v3,
 )
+from post_training.stitching import stitch_two_chunks_yup
 
 try:
     from hmr4d.network.base_arch.transformer.encoder_rope import RoPEAttention
@@ -296,6 +298,104 @@ class TestPPOComponents(unittest.TestCase):
             self.assertAlmostEqual(frac_a, 0.20, delta=0.02)
             self.assertAlmostEqual(frac_b, 0.55, delta=0.02)
             self.assertAlmostEqual(frac_c, 0.25, delta=0.02)
+
+    def test_reward_v3_seam_consistency_penalty(self) -> None:
+        t_len = 24
+        gt_jp = np.zeros((3, t_len, 29), dtype=np.float32)
+        gt_bp = np.zeros((3, t_len, 30, 3), dtype=np.float32)
+        trk = [
+            {"valid": True, "is_success": True, "first_failure_frame_50hz": -1, "total_frames_50hz": 40, "exec_joint_mae_rad": 0.08, "exec_root_pos_err_m": 0.10}
+            for _ in range(3)
+        ]
+        # Sample 0: zero overlap err & seam_jump <= interior_step -> seam_score == 1.0
+        # Sample 1: moderate seam jump & overlap err -> intermediate seam_score
+        # Sample 2: 6x stitch-seam jump (0.084 rad vs 0.014 interior) -> sharp penalty
+        ov = np.array([0.0, 0.03, 0.09], dtype=np.float32)
+        sj = np.array([0.010, 0.044, 0.084], dtype=np.float32)
+        istep = np.array([0.014, 0.014, 0.014], dtype=np.float32)
+
+        w3 = make_reward_weights_v3()
+        out = compute_sample_rewards(
+            trk, gt_jp, gt_bp, gt_jp, gt_bp, np.array([t_len] * 3), w3, fps=30.0,
+            seam_overlap_err=ov, seam_joint_jump=sj, interior_joint_step=istep,
+        )
+        self.assertAlmostEqual(float(out["seam_score"][0]), 1.0, places=5)
+        self.assertGreater(float(out["seam_score"][0]), float(out["seam_score"][1]))
+        self.assertGreater(float(out["seam_score"][1]), float(out["seam_score"][2]))
+        self.assertGreater(float(out["reward"][0] - out["reward"][2]), 0.5)
+
+    def test_stitched_key_weighted_sampler(self) -> None:
+        try:
+            from post_training.dataset_stitched import StitchedKeyWeightedDistributedSampler
+        except ImportError:
+            self.skipTest("dataset_stitched deps unavailable in minimal CPU test env")
+
+        meta_keys = (
+            [("bedlam2", f"hard_{i}") for i in range(10)]
+            + [("bedlam2", f"easy_{i}") for i in range(10)]
+            + [("h36m", f"bad_{i}") for i in range(5)]
+        )
+        untrackable = {("h36m", f"bad_{i}") for i in range(5)}
+        hard_ab = {("bedlam2", f"hard_{i}") for i in range(10)}
+        sampler = StitchedKeyWeightedDistributedSampler(
+            meta_keys=meta_keys,
+            untrackable_keys=untrackable,
+            hard_ab_keys=hard_ab,
+            num_replicas=2,
+            rank=0,
+            hard_weight_mult=3.0,
+            num_samples_per_epoch=20000,
+            seed=11,
+        )
+        self.assertEqual(sampler.stats, {"hard_pairs": 10, "easy_pairs": 10, "excluded_untrackable": 5})
+        draws = list(sampler)
+        self.assertEqual(len(draws), 10000)
+        # Zero untrackable draws (indices 20..24)
+        self.assertEqual(sum(1 for d in draws if d >= 20), 0)
+        # Expected hard fraction = (10*3) / (10*3 + 10*1) = 0.75
+        frac_hard = sum(1 for d in draws if d < 10) / len(draws)
+        self.assertAlmostEqual(frac_hard, 0.75, delta=0.02)
+
+    def test_batched_stitch_matches_infer_video_align(self) -> None:
+        from tools.infer_video import align_window_to_previous
+
+        torch.manual_seed(17)
+        n, w = 4, 12
+        jp0 = torch.randn(n, w, 29)
+        jp1 = torch.randn(n, w, 29)
+        rp0 = torch.randn(n, w, 3)
+        rp1 = torch.randn(n, w, 3)
+        rq0 = torch.nn.functional.normalize(torch.randn(n, w, 4), dim=-1)
+        rq1 = torch.nn.functional.normalize(torch.randn(n, w, 4), dim=-1)
+        bp0 = torch.randn(n, w, 30, 3)
+        bp1 = torch.randn(n, w, 30, 3)
+
+        jp_s, rp_s, rq_s, bp_s, seam = stitch_two_chunks_yup(jp0, rp0, rq0, bp0, jp1, rp1, rq1, bp1)
+        self.assertEqual(tuple(jp_s.shape), (n, 2 * w - 1, 29))
+        self.assertEqual(tuple(rp_s.shape), (n, 2 * w - 1, 3))
+        self.assertEqual(tuple(rq_s.shape), (n, 2 * w - 1, 4))
+        self.assertEqual(tuple(bp_s.shape), (n, 2 * w - 1, 30, 3))
+
+        for i in range(n):
+            ref_rp1, ref_rq1, ref_bp1 = align_window_to_previous(
+                rp1[i], rq1[i], bp1[i], rp0[i, -1], rq0[i, -1]
+            )
+            self.assertLess(float((rp_s[i, w:] - ref_rp1[1:]).abs().max().item()), 1e-5)
+            self.assertLess(float((bp_s[i, w:] - ref_bp1[1:]).abs().max().item()), 1e-5)
+            # Quaternions q and -q represent identical rotation
+            dot = (rq_s[i, w:] * ref_rq1[1:]).sum(dim=-1).abs()
+            self.assertTrue(bool((dot > 1.0 - 1e-5).all().item()))
+            # Verify exact seam metrics
+            self.assertAlmostEqual(
+                float(seam["overlap_err"][i].item()),
+                float((jp1[i, 0] - jp0[i, -1]).abs().mean().item()),
+                places=6,
+            )
+            self.assertAlmostEqual(
+                float(seam["seam_jump"][i].item()),
+                float((jp_s[i, w] - jp_s[i, w - 1]).abs().mean().item()),
+                places=6,
+            )
 
 
 if __name__ == "__main__":
