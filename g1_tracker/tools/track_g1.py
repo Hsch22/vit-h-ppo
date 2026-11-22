@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-hz", type=float, default=50.0)
     parser.add_argument("--ort-threads", type=int, default=1)
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Parallel CPU worker processes for batched NPZ inputs (default: 1).",
+    )
+    parser.add_argument(
         "--render-video",
         action="store_true",
         help="Render the tracked motion to an MP4 file with MuJoCo.",
@@ -55,6 +61,7 @@ def main() -> None:
         input_fps=args.input_fps,
         control_hz=args.control_hz,
         ort_threads=args.ort_threads,
+        num_workers=args.num_workers,
         render_video=args.render_video,
         video_output=args.video_output,
         video_width=args.video_width,

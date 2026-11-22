@@ -3,7 +3,7 @@
 amass_00:
   _target_: hmr4d.dataset.pure_motion.g1_amass.G1AmassDualPthDataset
   amass_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_00/motion.pth"
-  g1_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_00/g1.pth"
+  g1_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_00/${oc.env:VITH_G1_PTH_NAME,g1.pth}"
   g1_input_is_yup: true
   amass_fps: 30.0
   motion_frames: 120
@@ -24,7 +24,7 @@ amass_00:
 amass_01:
   _target_: hmr4d.dataset.pure_motion.g1_amass.G1AmassDualPthDataset
   amass_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_01/motion.pth"
-  g1_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_01/g1.pth"
+  g1_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_01/${oc.env:VITH_G1_PTH_NAME,g1.pth}"
   g1_input_is_yup: true
   amass_fps: 30.0
   motion_frames: 120
@@ -46,7 +46,7 @@ bedlam2_00:
   _target_: hmr4d.dataset.bedlam.bedlam.Bedlam2G1Dataset
   data_dir: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_00"
   smplx_pth_name: motion.pth
-  g1_pth_name: g1.pth
+  g1_pth_name: "${oc.env:VITH_G1_PTH_NAME,g1.pth}"
   bbox_pth_paths:
     - "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_00/bbox_00.pth"
     - "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_00/bbox_01.pth"
@@ -72,7 +72,7 @@ bedlam2_01:
   _target_: hmr4d.dataset.bedlam.bedlam.Bedlam2G1Dataset
   data_dir: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_01"
   smplx_pth_name: motion.pth
-  g1_pth_name: g1.pth
+  g1_pth_name: "${oc.env:VITH_G1_PTH_NAME,g1.pth}"
   bbox_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_01/bbox.pth"
   vitpose_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_01/keypoints.pth"
   imgfeat_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_01/image_features.pth"
@@ -92,7 +92,7 @@ bedlam2_02:
   _target_: hmr4d.dataset.bedlam.bedlam.Bedlam2G1Dataset
   data_dir: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_02"
   smplx_pth_name: motion.pth
-  g1_pth_name: g1.pth
+  g1_pth_name: "${oc.env:VITH_G1_PTH_NAME,g1.pth}"
   bbox_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_02/bbox.pth"
   vitpose_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_02/keypoints.pth"
   imgfeat_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam2/part_02/image_features.pth"
@@ -114,7 +114,7 @@ bedlam_00:
   _target_: hmr4d.dataset.bedlam.bedlam.BedlamG1Dataset
   data_dir: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam/part_00"
   smplx_pth_name: motion.pth
-  g1_pth_name: g1.pth
+  g1_pth_name: "${oc.env:VITH_G1_PTH_NAME,g1.pth}"
   bbox_pth_paths:
     - "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam/part_00/bbox_00.pth"
     - "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam/part_00/bbox_01.pth"
@@ -140,7 +140,7 @@ bedlam_01:
   _target_: hmr4d.dataset.bedlam.bedlam.BedlamG1Dataset
   data_dir: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam/part_01"
   smplx_pth_name: motion.pth
-  g1_pth_name: g1.pth
+  g1_pth_name: "${oc.env:VITH_G1_PTH_NAME,g1.pth}"
   bbox_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam/part_01/bbox.pth"
   vitpose_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam/part_01/keypoints.pth"
   imgfeat_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/bedlam/part_01/image_features.pth"
@@ -160,7 +160,7 @@ h36m_00:
   _target_: hmr4d.dataset.h36m.h36m.H36mG1Dataset
   data_dir: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/h36m/part_00"
   smplx_pth_name: motion.pth
-  g1_pth_name: g1.pth
+  g1_pth_name: "${oc.env:VITH_G1_PTH_NAME,g1.pth}"
   bbox_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/h36m/part_00/bbox.pth"
   vitpose_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/h36m/part_00/keypoints.pth"
   imgfeat_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/h36m/part_00/image_features.pth"
@@ -179,7 +179,7 @@ h36m_01:
   _target_: hmr4d.dataset.h36m.h36m.H36mG1Dataset
   data_dir: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/h36m/part_01"
   smplx_pth_name: motion.pth
-  g1_pth_name: g1.pth
+  g1_pth_name: "${oc.env:VITH_G1_PTH_NAME,g1.pth}"
   bbox_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/h36m/part_01/bbox.pth"
   vitpose_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/h36m/part_01/keypoints.pth"
   imgfeat_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/h36m/part_01/image_features.pth"

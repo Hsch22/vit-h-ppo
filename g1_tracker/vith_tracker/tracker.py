@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import atexit
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -815,6 +817,81 @@ def _resolve_fps(values: dict[str, np.ndarray], requested: float | None) -> floa
     return fps
 
 
+_WORKER_RUNNER: DeployRolloutRunner | None = None
+_WORKER_GROUNDER: InitialSupportGrounder | None = None
+
+
+def _close_worker_state() -> None:
+    global _WORKER_RUNNER, _WORKER_GROUNDER
+    if _WORKER_RUNNER is not None:
+        _WORKER_RUNNER.close()
+        _WORKER_RUNNER = None
+    _WORKER_GROUNDER = None
+
+
+def _init_tracker_worker(
+    policy_onnx: str,
+    xml_path: str,
+    grounding_xml: str,
+    control_hz: float,
+    ort_threads: int,
+) -> None:
+    global _WORKER_RUNNER, _WORKER_GROUNDER
+    policy = DeployPolicy(Path(policy_onnx), ort_threads)
+    _WORKER_RUNNER = DeployRolloutRunner(Path(xml_path), policy, control_hz)
+    _WORKER_GROUNDER = InitialSupportGrounder(Path(grounding_xml))
+    atexit.register(_close_worker_state)
+
+
+def _rollout_single_sample(
+    sample_values: dict[str, np.ndarray],
+    fps: float,
+    control_hz: float,
+    frames: int,
+    sample_index: int,
+    grounder: InitialSupportGrounder,
+    runner: DeployRolloutRunner,
+) -> dict[str, object]:
+    reference = resample_motion(sample_values, fps, control_hz, sample_index)
+    reference, offset = grounder.ground(reference)
+    initial_joint_pos, clip_delta = grounder.clip_initial_joint_pos(
+        reference.joint_pos[0]
+    )
+    rollout_50, is_success, first_failure = runner.rollout(
+        reference, initial_joint_pos
+    )
+    sampled = resample_rollout(rollout_50, frames, control_hz, fps)
+    clipped = np.abs(clip_delta) > 1.0e-8
+    return {
+        "sampled": sampled,
+        "is_success": is_success,
+        "first_failure": -1 if first_failure is None else first_failure,
+        "grounding_offset": offset,
+        "initial_root_linear": reference.root_lin_vel_w[0],
+        "initial_root_angular": reference.root_ang_vel_w[0],
+        "initial_joint_velocity": reference.joint_vel[0],
+        "clip_count": int(clipped.sum()),
+        "clip_max": float(np.abs(clip_delta).max(initial=0.0)),
+    }
+
+
+def _worker_rollout_task(
+    task: tuple[dict[str, np.ndarray], float, float, int],
+) -> dict[str, object]:
+    if _WORKER_RUNNER is None or _WORKER_GROUNDER is None:
+        raise RuntimeError("Tracker worker was not initialized")
+    sample_values, fps, control_hz, frames = task
+    return _rollout_single_sample(
+        sample_values,
+        fps,
+        control_hz,
+        frames,
+        0,
+        _WORKER_GROUNDER,
+        _WORKER_RUNNER,
+    )
+
+
 def track_file(
     input_path: Path,
     output_path: Path,
@@ -824,11 +901,14 @@ def track_file(
     input_fps: float | None = None,
     control_hz: float = 50.0,
     ort_threads: int = 1,
+    num_workers: int = 1,
     render_video: bool = False,
     video_output: Path | None = None,
     video_width: int = 640,
     video_height: int = 480,
 ) -> dict[str, np.ndarray]:
+    if int(num_workers) < 1:
+        raise ValueError(f"num_workers must be >= 1, got {num_workers}")
     paths = [Path(path).expanduser().resolve() for path in (
         input_path, policy_onnx, xml_path, grounding_xml
     )]
@@ -844,42 +924,55 @@ def track_file(
     fps = _resolve_fps(raw_values, input_fps)
     values, samples, frames = _batched_payload(raw_values)
 
-    policy = DeployPolicy(policy_onnx, ort_threads)
-    runner = DeployRolloutRunner(xml_path, policy, control_hz)
-    grounder = InitialSupportGrounder(grounding_xml)
-    collected = {key: [] for key in REQUIRED_INPUT_FIELDS}
-    successes = []
-    failures = []
-    grounding_offsets = []
-    initial_root_linear = []
-    initial_root_angular = []
-    initial_joint_velocity = []
-    clip_counts = []
-    clip_maxima = []
-    try:
-        for sample_index in range(samples):
-            reference = resample_motion(values, fps, control_hz, sample_index)
-            reference, offset = grounder.ground(reference)
-            initial_joint_pos, clip_delta = grounder.clip_initial_joint_pos(
-                reference.joint_pos[0]
+    worker_count = min(int(num_workers), samples)
+    if worker_count == 1:
+        policy = DeployPolicy(policy_onnx, ort_threads)
+        runner = DeployRolloutRunner(xml_path, policy, control_hz)
+        grounder = InitialSupportGrounder(grounding_xml)
+        try:
+            records = [
+                _rollout_single_sample(
+                    values, fps, control_hz, frames, sample_index, grounder, runner
+                )
+                for sample_index in range(samples)
+            ]
+        finally:
+            runner.close()
+    else:
+        tasks = [
+            (
+                {key: values[key][sample_index : sample_index + 1] for key in REQUIRED_INPUT_FIELDS},
+                fps,
+                control_hz,
+                frames,
             )
-            rollout_50, is_success, first_failure = runner.rollout(
-                reference, initial_joint_pos
-            )
-            sampled = resample_rollout(rollout_50, frames, control_hz, fps)
-            for key in collected:
-                collected[key].append(sampled[key])
-            successes.append(is_success)
-            failures.append(-1 if first_failure is None else first_failure)
-            grounding_offsets.append(offset)
-            initial_root_linear.append(reference.root_lin_vel_w[0])
-            initial_root_angular.append(reference.root_ang_vel_w[0])
-            initial_joint_velocity.append(reference.joint_vel[0])
-            clipped = np.abs(clip_delta) > 1.0e-8
-            clip_counts.append(int(clipped.sum()))
-            clip_maxima.append(float(np.abs(clip_delta).max(initial=0.0)))
-    finally:
-        runner.close()
+            for sample_index in range(samples)
+        ]
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_init_tracker_worker,
+            initargs=(
+                str(policy_onnx),
+                str(xml_path),
+                str(grounding_xml),
+                control_hz,
+                ort_threads,
+            ),
+        ) as executor:
+            records = list(executor.map(_worker_rollout_task, tasks))
+
+    collected = {
+        key: [record["sampled"][key] for record in records]
+        for key in REQUIRED_INPUT_FIELDS
+    }
+    successes = [record["is_success"] for record in records]
+    failures = [record["first_failure"] for record in records]
+    grounding_offsets = [record["grounding_offset"] for record in records]
+    initial_root_linear = [record["initial_root_linear"] for record in records]
+    initial_root_angular = [record["initial_root_angular"] for record in records]
+    initial_joint_velocity = [record["initial_joint_velocity"] for record in records]
+    clip_counts = [record["clip_count"] for record in records]
+    clip_maxima = [record["clip_max"] for record in records]
 
     result = {key: np.concatenate(items, axis=0) for key, items in collected.items()}
     result.update(

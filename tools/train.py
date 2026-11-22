@@ -61,6 +61,17 @@ def train(cfg: DictConfig) -> None:
     if cfg.seed is not None:
         pl.seed_everything(cfg.seed)
 
+    matmul_precision = os.environ.get("VITH_MATMUL_PRECISION")
+    if matmul_precision is not None:
+        valid_precisions = ("highest", "high", "medium")
+        if matmul_precision not in valid_precisions:
+            raise ValueError(
+                f"VITH_MATMUL_PRECISION must be one of {valid_precisions}, "
+                f"got {matmul_precision!r}."
+            )
+        torch.set_float32_matmul_precision(matmul_precision)
+        Log.info(f"[Precision] torch.set_float32_matmul_precision({matmul_precision!r})")
+
     # Initialize W&B before constructing the model/data module or entering
     # Trainer.fit(), because Lightning's subprocess DDP launcher otherwise
     # starts every local rank before rank 0 discovers an authentication or

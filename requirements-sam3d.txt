@@ -1,0 +1,26 @@
+# Validated combined ViT-H + Fast-SAM-3D-Body runtime overlay (Linux x86_64, Python 3.10, CUDA 12.1, Hopper H100 sm_90).
+# Why PyTorch 2.4.1+cu121 instead of 2.3.0+cu121:
+#   Fast-SAM-3D-Body loads facebookresearch/dinov3 via torch.hub, whose hubconf
+#   imports `from torch.amp import custom_fwd, custom_bwd` (added in PyTorch 2.4).
+#   PyTorch 2.4.1+cu121 satisfies dinov3, retains weights_only=False default for
+#   ultralytics==8.2.42, and has an official prebuilt PyTorch3D 0.7.8 wheel.
+#
+# Install base requirements first (using --no-build-isolation for chumpy and
+# cython_bbox), then apply this overlay:
+#   python -m pip install -r requirements-sam3d.txt
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+triton==3.0.0
+nvidia-cudnn-cu12==9.1.0.70
+pytorch3d @ https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt241/pytorch3d-0.7.8-cp310-cp310-linux_x86_64.whl
+numpy==1.23.5
+roma
+pyrender
+loguru
+optree
+fvcore
+huggingface_hub
+braceexpand
+webdataset
+pyrootutils

@@ -10,12 +10,23 @@ import re
 import sys
 import tempfile
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import urlopen
+import time
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROFILES = ("base", "tracker", "optional", "all")
+DEFAULT_HF_ENDPOINT = "https://huggingface.co"
+
+
+def resolve_hf_endpoint(explicit=None):
+    raw = explicit if explicit is not None else os.environ.get("HF_ENDPOINT", DEFAULT_HF_ENDPOINT)
+    endpoint = str(raw).strip().rstrip("/")
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"Invalid Hugging Face endpoint URL: {raw!r}")
+    return endpoint
 
 
 def load_manifest():
@@ -59,40 +70,57 @@ def verify(path, item):
         raise ValueError(f"SHA-256 mismatch: {path}")
 
 
-def download(root, manifest, item):
+def download(root, manifest, item, hf_endpoint=None, retries=3):
+    if int(retries) < 1:
+        raise ValueError(f"retries must be >= 1, got {retries}")
     destination = root / item["local_path"]
     if destination.exists():
         verify(destination, item)
         print(f"Already verified: {item['local_path']}", flush=True)
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
+    endpoint = resolve_hf_endpoint(hf_endpoint)
     url = (
-        f"https://huggingface.co/datasets/{manifest['repo_id']}/resolve/"
+        f"{endpoint}/datasets/{manifest['repo_id']}/resolve/"
         f"{manifest['revision']}/{quote(item['path'], safe='/')}"
     )
-    temporary = None
-    try:
-        print(f"Downloading {item['path']} ({item['size_bytes'] / 1e6:.1f} MB)", flush=True)
-        with tempfile.NamedTemporaryFile(
-            prefix=destination.name + ".", suffix=".part",
-            dir=destination.parent, delete=False,
-        ) as output:
-            temporary = Path(output.name)
-            with urlopen(url, timeout=120) as response:
-                for block in iter(lambda: response.read(4 * 1024 * 1024), b""):
-                    output.write(block)
-        verify(temporary, item)
-        # An exclusive hard link publishes the verified file without replacing
-        # an existing checkpoint, including one created by a concurrent job.
-        os.link(temporary, destination)
-        print(f"Verified: {item['local_path']}", flush=True)
-    except HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code} downloading {item['path']}") from None
-    except URLError:
-        raise RuntimeError(f"Network error downloading {item['path']}") from None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    last_error = None
+    for attempt in range(1, int(retries) + 1):
+        temporary = None
+        try:
+            print(
+                f"Downloading {item['path']} ({item['size_bytes'] / 1e6:.1f} MB) "
+                f"from {endpoint} (attempt {attempt}/{retries})",
+                flush=True,
+            )
+            with tempfile.NamedTemporaryFile(
+                prefix=destination.name + ".", suffix=".part",
+                dir=destination.parent, delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                with urlopen(url, timeout=120) as response:
+                    for block in iter(lambda: response.read(4 * 1024 * 1024), b""):
+                        output.write(block)
+            verify(temporary, item)
+            # An exclusive hard link publishes the verified file without replacing
+            # an existing checkpoint, including one created by a concurrent job.
+            os.link(temporary, destination)
+            print(f"Verified: {item['local_path']}", flush=True)
+            return
+        except HTTPError as exc:
+            last_error = RuntimeError(f"HTTP {exc.code} downloading {item['path']}")
+            if exc.code not in (429, 500, 502, 503, 504) or attempt == int(retries):
+                raise last_error from None
+        except (URLError, TimeoutError) as exc:
+            last_error = RuntimeError(f"Network error downloading {item['path']}: {exc}")
+            if attempt == int(retries):
+                raise last_error from None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        time.sleep(min(2 * attempt, 10))
+    if last_error is not None:
+        raise last_error
 
 
 def main():
@@ -101,6 +129,20 @@ def main():
     parser.add_argument("--profile", choices=PROFILES)
     parser.add_argument("--root", type=Path, default=REPO_ROOT,
                         help="Artifact root, default: this repository")
+    parser.add_argument(
+        "--hf-endpoint",
+        default=None,
+        help=(
+            "Hugging Face base URL (default: HF_ENDPOINT env var or "
+            "https://huggingface.co; e.g., https://hf-mirror.com)"
+        ),
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="Download attempts for transient network errors (default: 3)",
+    )
     args = parser.parse_args()
     if args.command != "list" and args.profile is None:
         parser.error("download/verify requires an explicit --profile")
@@ -119,7 +161,7 @@ def main():
             verify(root / item["local_path"], item)
             print(f"Verified: {item['local_path']}", flush=True)
         else:
-            download(root, manifest, item)
+            download(root, manifest, item, hf_endpoint=args.hf_endpoint, retries=args.retries)
     print(f"Selected total: {sum(item['size_bytes'] for item in items) / 1e9:.3f} GB")
 
 

@@ -43,6 +43,11 @@ python scripts/checkpoints.py download --profile tracker
 python scripts/checkpoints.py verify --profile tracker
 ```
 
+If direct access to `https://huggingface.co` is restricted, pass `--hf-endpoint`
+or set `HF_ENDPOINT` (for example `HF_ENDPOINT=https://hf-mirror.com`). Every
+downloaded file is still verified against the manifest's pinned commit, byte
+size, and SHA-256 digest before publication.
+
 The `optional` profile is for optional assets such as DPVO and HMR2; `all`
 includes every manifest asset. Downloading a profile does not install the
 corresponding software or the external assets below. The released base uses
@@ -67,14 +72,18 @@ body models through their official providers:
 [SMPL](https://smpl.is.tue.mpg.de/). Preserve their access and usage terms;
 do not add these assets to Git.
 
-**The combined Fast-SAM/base Python environment has not been validated.**
+**Combined Fast-SAM/base Python environment:**
 The current extractor imports `sam_3d_body` in the same Python process as
-ViT-H. Creating a separate Fast-SAM conda environment and activating it
-does not establish a bridge to `vith-base`. Before running full inference,
-validate a compatible shared runtime with the required SAM3D imports,
-weights, and base dependencies. Record the installed versions and any
-required integration changes. This repository does not provide an
-unverified cross-environment launcher or silently switch encoders.
+ViT-H. Upstream `facebookresearch/dinov3` (loaded by `Fast-SAM-3D-Body` via
+`torch.hub`) imports `from torch.amp import custom_fwd, custom_bwd`, which was
+added in PyTorch 2.4 and fails under the release `torch==2.3.0+cu121` pin.
+Apply the validated [requirements-sam3d.txt](../requirements-sam3d.txt)
+overlay (`torch==2.4.1+cu121`, `torchvision==0.19.1+cu121`, `triton==3.0.0`,
+`nvidia-cudnn-cu12==9.1.0.70`, prebuilt `pytorch3d==0.7.8`, and the
+`sam_3d_body` runtime packages) on top of `requirements.txt` (using
+`--no-build-isolation` for `chumpy` and `cython_bbox`). Keep `vith-tracker`
+separate. This repository does not provide an unverified cross-environment
+launcher or silently switch encoders.
 
 DPVO is optional and additionally needs its external source/build. Follow
 [INFERENCE.md](INFERENCE.md) if explicitly using `--use-dpvo`. Otherwise
@@ -123,6 +132,11 @@ python g1_tracker/tools/track_g1.py \
   --grounding-xml g1_tracker/assets/g1/grounding/mjcf/g1_29dof_rev_1_0.xml
 ```
 
+For batched reference NPZ files (such as PPO rollout batches or dataset
+evaluation), pass `--num-workers N` (default `1`) to evaluate independent
+samples across parallel CPU worker processes while keeping `--ort-threads 1`
+per worker and preserving identical Protocol v4 outputs.
+
 The two XML paths have different roles and are not interchangeable.
 Keep the policy, XML assets, and protocol fixed when comparing the base
 with future PPO checkpoints. See [the tracker README](../g1_tracker/README.md)
@@ -131,6 +145,24 @@ for NPZ conventions, failure criteria, and optional rendering. Inspect
 does not mean successful tracking.
 
 ## Verification commands
+
+Before launching inference or training on a shared GPU node, run the preflight
+check to verify CUDA/GPU visibility, filesystem free space (including `TMPDIR`
+and cache directories), user-site isolation (`PYTHONNOUSERSITE=1`), release
+checkpoints, external SAM3D/MHR/SMPL-X assets, and `sam_3d_body` importability:
+
+```bash
+PYTHONNOUSERSITE=1 python scripts/preflight.py --mode base --require-gpu --verify-hash
+PYTHONNOUSERSITE=1 python scripts/preflight.py --mode tracker --verify-hash
+```
+
+For training runs via `scripts/train.sh`, throughput and scratch settings can
+be configured via environment variables without modifying defaults:
+`TRAIN_PRECISION` (default `32`, e.g. `bf16-mixed` on Hopper/Blackwell GPUs),
+`VITH_MATMUL_PRECISION` (`highest`, `high`, or `medium`), `BATCH_SIZE`,
+`NUM_WORKERS`, `VITH_TMPDIR`, and `VITH_G1_PTH_NAME` (default `g1.pth`, e.g.
+`g1_new.pth` when evaluating alternative retargeted G1 trajectories without
+overwriting the original `g1.pth` files).
 
 For CPU regressions, use an isolated Python 3.10 environment rather than
 installing the CUDA requirements on a laptop:

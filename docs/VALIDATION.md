@@ -94,3 +94,38 @@ tracker smoke command and CPU CI. The main requirements now explicitly
 include the directly imported `easydict` and `yacs` packages. Model math,
 checkpoint loading semantics, tracker policy, and evaluation thresholds
 remain those of the imported release.
+
+## Linux H100 end-to-end validation (2026-11-22)
+
+Recorded on Linux x86_64 with an NVIDIA H100 80GB HBM3 (`sm_90`) GPU using
+isolated Python 3.10.22 environments (`PYTHONNOUSERSITE=1`).
+
+### Combined Fast-SAM-3D-Body + ViT-H environment finding
+
+Upstream `facebookresearch/dinov3` (loaded by `Fast-SAM-3D-Body` via
+`torch.hub`) imports `from torch.amp import custom_fwd, custom_bwd`, which
+was added in PyTorch 2.4 and fails under the release `torch==2.3.0+cu121` pin.
+Applying [requirements-sam3d.txt](../requirements-sam3d.txt)
+(`torch==2.4.1+cu121`, `torchvision==0.19.1+cu121`, `triton==3.0.0`,
+`nvidia-cudnn-cu12==9.1.0.70`, prebuilt `pytorch3d==0.7.8`, `numpy==1.23.5`,
+and the `sam_3d_body` runtime packages) resolved the import cleanly with
+`pip check` passing in both `vith-base` and `vith-tracker`.
+
+### Verified on H100
+
+| Check | Observed result |
+| --- | --- |
+| Preflight (`base` & `tracker`) | `scripts/preflight.py --mode base --require-gpu --verify-hash` and `--mode tracker --verify-hash` both passed with `Isolated user-site: True`. |
+| Checkpoints & external assets | `base` (3.564 GB) and `tracker` (0.058 GB) profiles passed SHA-256 verification; `dpvo.pth` verified; external `sam-3d-body-dinov3/model.ckpt` (SHA-256 `b5a2f9d3...`), `mhr_model.pt` (Meta MHR v1.0.1, SHA-256 `352e271a...`), and `SMPLX_NEUTRAL.npz` (SMPL-X v1.1, SHA-256 `37602144...`) verified. |
+| Base + infra unit tests | 40/40 passed (`unittest discover -s tests`). |
+| Tracker unit tests & parallel equivalence | 5/5 passed including `num_workers=1` vs `num_workers=2` bit-exact equality; 8-sample 61-frame benchmark ran in 2.22s (`num_workers=8`) vs 4.66s (`num_workers=1`, 2.10x speedup, `np.array_equal` True across all fields). |
+| ViT-H 50-step DDIM GPU forward | Strict `load_pipeline` loaded in 5.62s; 120-frame 50-step DDIM forward ran in 0.77s with 0.91 GiB peak VRAM and finite outputs. |
+| Real-video end-to-end inference + tracking | 300-frame (10.0s @ 30 FPS, 960x540, 3 chunks) real human dancing video completed `tools/infer_video.py` (YOLO + ViTPose + Fast-SAM3D + SimpleVO + ViT-H) in 53s and `g1_tracker/tools/track_g1.py` in 4s. All reference and tracked arrays were finite; tracker Protocol v4 reported `is_success=[true]`, `first_failure_frame_50hz=[-1]`, `grounding_offset_m=[0.00566]`, `initial_joint_clip_count=[0]`. |
+
+### Still not implemented or verified
+
+- PPO policy density, critic, rollout buffer, reward, KL control, and training
+  are not yet implemented (`docs/PPO_INTEGRATION.md`).
+- Full multi-clip base evaluation, training-set staging, and multi-GPU
+  supervised/PPO training throughput remain to be run once the training dataset
+  is staged.

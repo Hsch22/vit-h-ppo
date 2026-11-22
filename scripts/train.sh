@@ -8,6 +8,9 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 NUM_DEVICES="${NUM_DEVICES:-8}"
 TRAIN_STRATEGY="${TRAIN_STRATEGY:-ddp_find_unused_parameters_true}"
+TRAIN_PRECISION="${TRAIN_PRECISION:-32}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
 
 export WANDB_MODE
 export PYTHONUNBUFFERED=1
@@ -15,6 +18,10 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+if [[ -n "${VITH_TMPDIR:-}" ]]; then
+  export TMPDIR="$VITH_TMPDIR"
+  mkdir -p "$TMPDIR"
+fi
 
 required_vars=(VITH_DATASET_ROOT)
 for name in "${required_vars[@]}"; do
@@ -52,11 +59,12 @@ exec "$PYTHON_BIN" -u tools/train.py \
   resume_mode=null \
   pl_trainer.devices="$NUM_DEVICES" \
   pl_trainer.strategy="$TRAIN_STRATEGY" \
+  pl_trainer.precision="$TRAIN_PRECISION" \
   pl_trainer.max_epochs=10000 \
   pl_trainer.log_every_n_steps=1 \
   pl_trainer.use_distributed_sampler=false \
-  data.loader_opts.train.batch_size=32 \
-  data.loader_opts.train.num_workers=1 \
+  data.loader_opts.train.batch_size="$BATCH_SIZE" \
+  data.loader_opts.train.num_workers="$NUM_WORKERS" \
   data.loader_opts.train.source_homogeneous_batches=false \
   +data.loader_opts.train.source_mixed_batches=true \
   "${logger_args[@]}" \
