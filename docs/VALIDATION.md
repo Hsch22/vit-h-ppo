@@ -166,7 +166,50 @@ Verified with `torchrun --standalone --nproc_per_node=2 post_training/train_ppo.
 | Steady-state 2-GPU PPO step timing | `roll=0.17s` (compiled BF16 CUDA-graph rollout), `trk=2.49s` (persistent tracker pool), `upd=1.40s` (DDP + fused `AdamW`), finite losses/gradients (`ratio≈0.989`, `clip≈0.02`, `kl≈0.034`, `gnorm≈1.46–3.98`). |
 | Checkpoint save/resume + strict `load_pipeline` | Resumed from `ppo_step_00003.pt` through step 5; `inspect_checkpoint_imgfeat_encoder` returned `'sam3d'`; `load_pipeline` strict load succeeded; parameter deltas confirmed `denoiser3d=9.374e-05` (>0) while `fixed_pe=0.0`, `aux_head=0.0`, and `cond_embedder=0.0`. |
 
-### Remaining long-horizon evaluation
+### 500-step 8-GPU DDP PPO pilot & paired Base-vs-PPO test evaluation (`g1_new.pth`)
 
-- Full multi-source (`h36m + bedlam + bedlam2`) 8-GPU DDP PPO convergence and
-  held-out base-vs-PPO comparison across full evaluation splits.
+An 8-GPU DDP pilot run (`max_steps=500`, `prompts_per_rank=4`, `group_size=4`,
+`128` trajectories/step, `ddim_steps=20`, `ddim_eta=0.7`, `lr=1e-5`,
+`kl_coef=0.04`, `w=(1.0, 0.5, 0.3, 1.0)`) trained over `h36m + bedlam + bedlam2`
+(`51,485` train clips, `2,883` val clips) completed cleanly (all 500 steps,
+`denoiser3d` relative L2 weight delta `2.972 / 2733.09 = 0.109%`).
+
+Paired Base (`vith_offline_g1.ckpt`) vs PPO (`ppo_step_00500.pt`) evaluation
+via `post_training/eval_compare.py` on **640 untouched `test` clips**
+(`140 h36m` + `250 bedlam` + `250 bedlam2`, identical initial noise `x_T`,
+released 50-step deterministic DDIM `eta=0.0`, frozen Protocol v4 tracker):
+
+| Metric (`n=640` paired `test` clips, DDIM-50 `eta=0.0`) | Base | PPO-500 | Delta (`PPO - Base`) | Paired significance |
+| --- | ---: | ---: | ---: | --- |
+| `success_rate` (Protocol v4) | 0.9859 (631/640) | 0.9859 (631/640) | `0.0000` (0 fixed / 0 regressed) | McNemar `p=1.0` |
+| `survival_ratio` | 0.99185 | 0.99193 | `+0.00008` | — |
+| `exec_joint_mae_rad` (lower better) | 0.10239 | **0.10173** | **`-0.00066`** (`-0.64%`) | `t = -6.11` (61.9% better) |
+| `exec_root_pos_err_m` (lower better) | 0.10484 | 0.10588 | `+0.00104` | `t = +1.52` (not sig.) |
+| `ref_joint_mae_rad` vs `g1_new.pth` | 0.13977 | **0.13929** | **`-0.00048`** | `t = -5.78` (61.4% better) |
+| `ref_body_mpjpe_m` vs `g1_new.pth` | 0.23428 | 0.23422 | `-0.00005` | `t = -1.53` (not sig.) |
+| `fidelity` | 0.51002 | **0.51057** | **`+0.00055`** | `t = +5.74` (60.3% better) |
+| `reward_v1` | 2.13406 | 2.13439 | `+0.00033` | `t = +1.26` (not sig.) |
+| `mean_joint_vel_rad_s` (GT: `0.4302`) | 0.38515 | 0.38274 | `-0.00240` (`-0.62%`) | `t = -14.55` |
+| `root_xy_path_m` (GT: `0.9800`) | 0.71253 | 0.71547 | `+0.00294` | `t = +6.73` |
+
+Additional diagnostic findings:
+- **Train-mode sampler check (`bedlam`, `n=250`, DDIM-20 `eta=0.7`)**: Base
+  scored `0.9640` (`241/250`), PPO-500 scored `0.9560` (`239/250`, `0` fixed /
+  `2` regressed, McNemar `p=0.50`), `exec_root_pos_err_m` `0.1169 -> 0.1156 m`,
+  confirming the small effect size is not merely a train-vs-deploy sampler gap.
+- **GT trackability audit on all 9 Base-failed clips**: 6 of the 9 clips also
+  failed Protocol v4 when tracking ground-truth `g1_new.pth` directly; only 3
+  of 640 (`0.47%`) were GT-trackable clips where Base failed.
+- **Real-video end-to-end check** (300-frame dancing clip, `tools/infer_video.py`
+  + `track_g1.py`, seed 42): both passed (`is_success=True`), with PPO-500
+  changing joint angles (`max_abs=0.1305 rad`, `mean_abs=0.0115 rad`) and
+  reducing `exec_root_err` (`0.2057 -> 0.1977 m`) and `exec_j_mae`
+  (`0.1699 -> 0.1681 rad`) while keeping `root_xy_path` identical (`2.491 m`).
+
+### Remaining open research questions
+
+- Uniform in-domain 120-frame sampling saturates near 98.6% Base success and
+  gave `fidelity` 3.3x more weight than `exec_track`, yielding only a `0.109%`
+  weight shift in 500 steps. Next-round PPO requires hard-clip / OOD /
+  longer-horizon mining, higher execution-tracking weight, and larger effective
+  update budgets verified against held-out hard benchmarks and real videos.
