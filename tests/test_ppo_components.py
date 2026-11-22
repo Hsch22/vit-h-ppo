@@ -17,7 +17,12 @@ from post_training.reward import (
     make_reward_weights_v2,
     make_reward_weights_v3,
 )
-from post_training.stitching import stitch_two_chunks_yup
+from post_training.stitching import (
+    chunk_windows,
+    slerp_quaternions,
+    stitch_sequence_yup,
+    stitch_two_chunks_yup,
+)
 
 try:
     from hmr4d.network.base_arch.transformer.encoder_rope import RoPEAttention
@@ -396,6 +401,79 @@ class TestPPOComponents(unittest.TestCase):
                 float((jp_s[i, w] - jp_s[i, w - 1]).abs().mean().item()),
                 places=6,
             )
+
+    def test_multi_frame_overlap_stitching_and_yaw_gravity_preservation(self) -> None:
+        from motion_lib.motion_utils.rotation_conversions import (
+            axis_angle_to_matrix,
+            matrix_to_quaternion,
+            quaternion_to_matrix,
+        )
+        from tools.infer_video import align_window_to_previous
+
+        # 1. chunk_windows coverage & minimum-tail invariant
+        for ov in (1, 16, 24):
+            for total_len in (120, 215, 216, 217, 240, 360, 601):
+                meta = chunk_windows(total_len, window=120, overlap=ov)
+                self.assertEqual(meta[0][0], 0)
+                self.assertEqual(meta[-1][0] + meta[-1][1], total_len)
+                for ci in range(1, len(meta)):
+                    prev_end = meta[ci - 1][0] + meta[ci - 1][1]
+                    start, act_len = meta[ci]
+                    self.assertEqual(prev_end - start, ov)
+                    self.assertGreaterEqual(act_len, ov + 1)
+
+        # 2. SLERP sign-flip invariance (q and -q represent the same rotation)
+        q0 = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        q1 = matrix_to_quaternion(axis_angle_to_matrix(torch.tensor([[0.0, 1.0, 0.0]])))
+        a = torch.tensor([0.5])
+        s_pos = slerp_quaternions(q0, q1, a)
+        s_neg = slerp_quaternions(q0, -q1, a)
+        self.assertGreater(float((s_pos * s_neg).sum().abs().item()), 1.0 - 1e-6)
+
+        # 3. overlap=1 so3 matches tools/infer_video.py align_window_to_previous on 3 chunks
+        torch.manual_seed(23)
+        chunks_1 = chunk_windows(260, window=120, overlap=1)
+        n_c = len(chunks_1)
+        jp_c = torch.randn(n_c, 120, 29)
+        rp_c = torch.randn(n_c, 120, 3)
+        rq_c = torch.nn.functional.normalize(torch.randn(n_c, 120, 4), dim=-1)
+        bp_c = torch.randn(n_c, 120, 30, 3)
+        out_1 = stitch_sequence_yup(jp_c, rp_c, rq_c, bp_c, chunks_1, total_len=260, align_mode="so3")
+        # Compare chunk 1 against align_window_to_previous directly
+        ref_rp1, ref_rq1, ref_bp1 = align_window_to_previous(
+            rp_c[1], rq_c[1], bp_c[1], rp_c[0, -1], rq_c[0, -1]
+        )
+        self.assertLess(float((out_1["root_pos_w"][120:239] - ref_rp1[1:]).abs().max().item()), 1e-5)
+        self.assertLess(float((out_1["body_pos_w"][120:239] - ref_bp1[1:]).abs().max().item()), 1e-5)
+        self.assertTrue(bool(((out_1["root_quat_w"][120:239] * ref_rq1[1:]).sum(dim=-1).abs() > 1.0 - 1e-5).all()))
+
+        # 4. overlap=24 cosine blend slashes a 0.10 rad step jump by >10x & invokes fk_fn
+        chunks_24 = chunk_windows(216, window=120, overlap=24)  # exactly 2 chunks: (0,120), (96,120)
+        jp_two = torch.zeros(2, 120, 29)
+        jp_two[1] = 0.10  # 0.10 rad step discontinuity between windows
+        rp_two = torch.zeros(2, 120, 3)
+        # Chunk 0 has a 10-degree roll tilt; chunk 1 is upright with +30 deg yaw.
+        R0 = axis_angle_to_matrix(torch.tensor([0.0, 0.0, 0.1745])).expand(120, 3, 3)
+        R1 = axis_angle_to_matrix(torch.tensor([0.0, 0.5236, 0.0])).expand(120, 3, 3)
+        rq_two = torch.stack([matrix_to_quaternion(R0), matrix_to_quaternion(R1)], dim=0)
+        bp_two = torch.zeros(2, 120, 30, 3)
+        fk_called = {"n": 0}
+
+        def _fake_fk(jp, rp, rq):
+            fk_called["n"] += 1
+            return rp[:, None, :].expand(-1, 30, -1).clone()
+
+        out_yaw = stitch_sequence_yup(
+            jp_two, rp_two, rq_two, bp_two, chunks_24, total_len=216,
+            align_mode="yaw", blend_mode="cosine", fk_fn=_fake_fk,
+        )
+        self.assertEqual(fk_called["n"], 1)
+        diffs = (out_yaw["joint_pos"][1:] - out_yaw["joint_pos"][:-1]).abs().mean(dim=-1)
+        self.assertLess(float(diffs.max().item()), 0.01)  # < 1/10th of 0.10 rad discontinuity
+        # After overlap (frame >= 120), yaw-only alignment MUST keep chunk 1 upright (+Y preserved!)
+        R_after = quaternion_to_matrix(out_yaw["root_quat_w"][120:])
+        up_vec = R_after[:, :, 1]  # transformed +Y axis
+        self.assertLess(float((up_vec - torch.tensor([0.0, 1.0, 0.0])).abs().max().item()), 1e-5)
 
 
 if __name__ == "__main__":

@@ -34,8 +34,8 @@ from hmr4d.utils.geo.hmr_cam import normalize_kp2d
 from post_training.dataset import VIDEO_SOURCE_SPECS
 from post_training.eval_compare import _exact_mcnemar_p, build_condition, sample_ddim_paired
 from post_training.policy import G1_PRED_X_DIM, YUP_TO_ZUP_M
+from post_training.stitching import chunk_windows, stitch_sequence_yup
 from post_training.tracker_pool import PersistentTrackerPool
-from tools.infer_video import align_window_to_previous
 from tools.inference_utils import load_pipeline
 
 
@@ -45,13 +45,8 @@ def _pad_window(x: torch.Tensor, pad_len: int) -> torch.Tensor:
     return torch.cat([x, x[-1:].expand(pad_len, *x.shape[1:])], dim=0)
 
 
-def _chunk_windows(total_len: int, window: int = 120) -> list[tuple[int, int]]:
-    if total_len <= window:
-        return [(0, total_len)]
-    starts = [0]
-    while starts[-1] + window < total_len:
-        starts.append(starts[-1] + window - 1)
-    return [(s, min(window, total_len - s)) for s in starts]
+def _chunk_windows(total_len: int, window: int = 120, overlap: int = 1) -> list[tuple[int, int]]:
+    return chunk_windows(total_len, window=window, overlap=overlap)
 
 
 @torch.no_grad()
@@ -107,9 +102,11 @@ def infer_stitched_sequence(
     ddim_eta: float,
     use_bf16: bool,
     window: int = 120,
+    align_mode: str = "so3",
+    blend_mode: str = "cosine",
 ) -> dict[str, np.ndarray]:
-    """Run batched chunk DDIM + exact tools/infer_video.py rigid stitching -> Z-up numpy."""
-    from pytorch3d.transforms import matrix_to_quaternion, quaternion_to_matrix
+    """Run batched chunk DDIM + single- or multi-frame overlap stitching -> Z-up numpy."""
+    from motion_lib.motion_utils.rotation_conversions import matrix_to_quaternion, quaternion_to_matrix
 
     total_len = int(sample["length"])
     obs_full = select_coco17_no_nose_ears(normalize_kp2d(sample["kp2d"], sample["bbx_xys"])).float()
@@ -152,34 +149,27 @@ def infer_stitched_sequence(
         pipeline, x0_chunks, batch_gpu["cam_angvel"], length_t, root0_chunks
     )
 
-    jp_out = torch.zeros(total_len, 29, device=device)
-    rp_out = torch.zeros(total_len, 3, device=device)
-    rq_out = torch.zeros(total_len, 4, device=device)
-    bp_out = torch.zeros(total_len, bp_c.shape[2], 3, device=device)
+    def _fk_g1_single(jp: torch.Tensor, rp: torch.Tensor, rq: torch.Tensor) -> torch.Tensor:
+        bp, _ = pipeline.endecoder.fk_g1(jp.unsqueeze(0), rp.unsqueeze(0), rq.unsqueeze(0), world_up="y")
+        return bp[0]
 
-    prev_pos = None
-    prev_quat = None
-    seam_indices: list[int] = []
-
-    for ci, (start, actual_len) in enumerate(chunks_meta):
-        end = start + actual_len
-        p_jp = jp_c[ci, :actual_len]
-        p_rp = rp_c[ci, :actual_len]
-        p_rq = rq_c[ci, :actual_len]
-        p_bp = bp_c[ci, :actual_len]
-        if prev_quat is not None:
-            p_rp, p_rq, p_bp = align_window_to_previous(p_rp, p_rq, p_bp, prev_pos, prev_quat)
-            seam_indices.append(start)
-        if ci == 0:
-            ws, ss = slice(start, end), slice(0, actual_len)
-        else:
-            ws, ss = slice(start + 1, end), slice(1, actual_len)
-        jp_out[ws] = p_jp[ss]
-        rp_out[ws] = p_rp[ss]
-        rq_out[ws] = p_rq[ss]
-        bp_out[ws] = p_bp[ss]
-        prev_pos = p_rp[actual_len - 1].detach()
-        prev_quat = p_rq[actual_len - 1].detach()
+    stitched = stitch_sequence_yup(
+        jp_c=jp_c,
+        rp_c=rp_c,
+        rq_c=rq_c,
+        bp_c=bp_c,
+        chunks_meta=chunks_meta,
+        total_len=total_len,
+        align_mode=align_mode,
+        blend_mode=blend_mode,
+        fk_fn=_fk_g1_single,
+    )
+    jp_out = stitched["joint_pos"]
+    rp_out = stitched["root_pos_w"]
+    rq_out = stitched["root_quat_w"]
+    bp_out = stitched["body_pos_w"]
+    seam_indices = stitched["seam_indices"]
+    overlap_spans = stitched["overlap_spans"]
 
     M_pos = torch.tensor(YUP_TO_ZUP_M, device=device, dtype=torch.float32)
     rp_z = rp_out @ M_pos
@@ -188,13 +178,26 @@ def infer_stitched_sequence(
 
     jp_np = jp_out.cpu().numpy().astype(np.float32)
     diffs = np.mean(np.abs(np.diff(jp_np, axis=0)), axis=-1)  # (T-1,)
-    seam_jumps = [float(diffs[idx]) for idx in seam_indices if 0 <= idx < len(diffs)]
+    seam_jumps: list[float] = []
+    overlap_mean_steps: list[float] = []
     interior_mask = np.ones(len(diffs), dtype=bool)
-    for idx in seam_indices:
-        if 0 <= idx < len(diffs):
-            interior_mask[idx] = False
+    for s, e in overlap_spans:
+        if e - s == 1:
+            if 0 <= s < len(diffs):
+                seam_jumps.append(float(diffs[s]))
+                overlap_mean_steps.append(float(diffs[s]))
+                interior_mask[s] = False
+        else:
+            lo = max(0, s - 1)
+            hi = min(len(diffs), e)
+            if hi > lo:
+                zone = diffs[lo:hi]
+                seam_jumps.append(float(np.max(zone)))
+                overlap_mean_steps.append(float(np.mean(zone)))
+                interior_mask[lo:hi] = False
     interior_step = float(np.mean(diffs[interior_mask])) if interior_mask.any() else 0.0
     seam_jump = float(np.mean(seam_jumps)) if seam_jumps else 0.0
+    overlap_mean_step = float(np.mean(overlap_mean_steps)) if overlap_mean_steps else 0.0
 
     return {
         "joint_pos": jp_np,
@@ -202,7 +205,9 @@ def infer_stitched_sequence(
         "root_quat_w": rq_z.cpu().numpy().astype(np.float32),
         "body_pos_w": bp_z.cpu().numpy().astype(np.float32),
         "seam_indices": seam_indices,
+        "overlap_spans": overlap_spans,
         "seam_joint_jump_rad": seam_jump,
+        "overlap_mean_step_rad": overlap_mean_step,
         "interior_joint_step_rad": interior_step,
     }
 
@@ -221,8 +226,26 @@ def _extract_gt_zup(sample: dict[str, Any]) -> dict[str, np.ndarray]:
     return {"joint_pos": jp, "root_pos_w": rp_z, "root_quat_w": rq_z, "body_pos_w": bp_z}
 
 
-def _seam_distance_50hz(fail_50: int, seam_indices: list[int], fps: float, control_hz: float = 50.0) -> int | None:
-    if fail_50 < 0 or not seam_indices:
+def _seam_distance_50hz(
+    fail_50: int,
+    seam_indices: list[int],
+    fps: float,
+    control_hz: float = 50.0,
+    overlap_spans: list[tuple[int, int]] | None = None,
+) -> int | None:
+    if fail_50 < 0:
+        return None
+    if overlap_spans:
+        dists = []
+        for s, e in overlap_spans:
+            s50 = int(round(s * control_hz / fps))
+            e50 = int(round(max(s, e - 1) * control_hz / fps))
+            if s50 <= fail_50 <= e50:
+                dists.append(0)
+            else:
+                dists.append(min(abs(fail_50 - s50), abs(fail_50 - e50)))
+        return int(min(dists))
+    if not seam_indices:
         return None
     seams_50 = [int(round(s * control_hz / fps)) for s in seam_indices]
     return int(min(abs(fail_50 - s50) for s50 in seams_50))
@@ -262,7 +285,9 @@ def _summarize(recs: list[dict[str, Any]]) -> dict[str, Any]:
             entry["ref_joint_mae_rad"] = float(np.nanmean([r[tag]["ref_joint_mae_rad"] for r in recs]))
             entry["ref_body_mpjpe_m"] = float(np.nanmean([r[tag]["ref_body_mpjpe_m"] for r in recs]))
             entry["seam_joint_jump_rad"] = float(np.mean([r[tag]["seam_joint_jump_rad"] for r in recs]))
+            entry["overlap_mean_step_rad"] = float(np.mean([r[tag].get("overlap_mean_step_rad", r[tag]["seam_joint_jump_rad"]) for r in recs]))
             entry["interior_joint_step_rad"] = float(np.mean([r[tag]["interior_joint_step_rad"] for r in recs]))
+            entry["mean_num_chunks"] = float(np.mean([r["num_chunks"] for r in recs]))
         out[tag] = entry
 
     if recs[0].get("ppo") is not None:
@@ -293,6 +318,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seqs-per-source", type=int, default=0)
     parser.add_argument("--ddim-steps", type=int, default=50)
     parser.add_argument("--ddim-eta", type=float, default=0.0)
+    parser.add_argument("--overlap", type=int, default=1, help="Number of overlap frames between adjacent 120f windows (1=hard stitch, >1=blended)")
+    parser.add_argument("--align-mode", type=str, default="so3", choices=("so3", "yaw"))
+    parser.add_argument("--blend-mode", type=str, default="cosine", choices=("cosine", "linear"))
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--tracker-python", type=Path, default=Path(os.environ.get("TRACKER_PYTHON_BIN", sys.executable)))
     parser.add_argument("--policy-onnx", type=Path, default=REPO_ROOT / "inputs/checkpoints/g1_tracker/model_step_020000_g1.onnx")
@@ -374,17 +402,21 @@ def main() -> None:
                     sample = ds[idx]
                     L = int(sample["length"])
                     fps = float(sample["fps"])
-                    chunks_meta = _chunk_windows(L, window=120)
+                    chunks_meta = _chunk_windows(L, window=120, overlap=args.overlap)
                     gen = torch.Generator(device=device).manual_seed(args.seed + (b_start + j_off) * 97)
                     x_inits = torch.randn((len(chunks_meta), 120, G1_PRED_X_DIM), device=device, dtype=torch.float32, generator=gen)
 
                     gt_z = _extract_gt_zup(sample)
                     base_z = infer_stitched_sequence(
-                        base_pipe, base_pipe.denoiser3d, sample, x_inits, chunks_meta, device, args.ddim_steps, args.ddim_eta, use_bf16
+                        base_pipe, base_pipe.denoiser3d, sample, x_inits, chunks_meta, device,
+                        args.ddim_steps, args.ddim_eta, use_bf16,
+                        align_mode=args.align_mode, blend_mode=args.blend_mode,
                     )
                     ppo_z = (
                         infer_stitched_sequence(
-                            ppo_pipe, ppo_pipe.denoiser3d, sample, x_inits, chunks_meta, device, args.ddim_steps, args.ddim_eta, use_bf16
+                            ppo_pipe, ppo_pipe.denoiser3d, sample, x_inits, chunks_meta, device,
+                            args.ddim_steps, args.ddim_eta, use_bf16,
+                            align_mode=args.align_mode, blend_mode=args.blend_mode,
                         )
                         if ppo_pipe is not None
                         else None
@@ -401,6 +433,7 @@ def main() -> None:
                         "duration_s": round(L / max(fps, 1e-3), 2),
                         "num_chunks": len(chunks_meta),
                         "seam_indices": base_z["seam_indices"],
+                        "overlap_spans": base_z["overlap_spans"],
                     })
 
                 # Submit all variable-length sequences in parallel using padded batch arrays.
@@ -439,7 +472,9 @@ def main() -> None:
                             "survival_ratio": 1.0 if succ else float(np.clip(fail / tot50, 0.0, 1.0)),
                             "exec_joint_mae_rad": float(trk_r["exec_joint_mae_rad"]),
                             "exec_root_pos_err_m": float(trk_r["exec_root_pos_err_m"]),
-                            "fail_dist_to_seam_50hz": _seam_distance_50hz(fail, m["seam_indices"], m["fps"]),
+                            "fail_dist_to_seam_50hz": _seam_distance_50hz(
+                                fail, m["seam_indices"], m["fps"], overlap_spans=m.get("overlap_spans")
+                            ),
                         }
                         if gt_d is not None:
                             jmae = float(np.mean(np.abs(pred_d["joint_pos"] - gt_d["joint_pos"])))
@@ -449,6 +484,7 @@ def main() -> None:
                             d_out["ref_joint_mae_rad"] = jmae
                             d_out["ref_body_mpjpe_m"] = mpjpe
                             d_out["seam_joint_jump_rad"] = pred_d["seam_joint_jump_rad"]
+                            d_out["overlap_mean_step_rad"] = pred_d["overlap_mean_step_rad"]
                             d_out["interior_joint_step_rad"] = pred_d["interior_joint_step_rad"]
                         return d_out
 
@@ -475,6 +511,9 @@ def main() -> None:
             "min_frames": args.min_frames,
             "ddim_steps": args.ddim_steps,
             "ddim_eta": args.ddim_eta,
+            "overlap": args.overlap,
+            "align_mode": args.align_mode,
+            "blend_mode": args.blend_mode,
             "base_ckpt": str(args.base_ckpt.resolve()),
             "ppo_ckpt": str(args.ppo_ckpt.resolve()) if args.ppo_ckpt else None,
             "elapsed_s": round(time.perf_counter() - t0, 2),
