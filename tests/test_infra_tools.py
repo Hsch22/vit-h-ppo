@@ -80,9 +80,10 @@ class TestTrainingSetG1FilenameConfig(unittest.TestCase):
             {"VITH_DATASET_ROOT": "/data/vith", "VITH_G1_PTH_NAME": "g1_new.pth"},
             clear=False,
         ):
+            os.environ.pop("VITH_AMASS_G1_PTH_NAME", None)
             cfg = OmegaConf.load(cfg_path)
-            self.assertEqual(cfg.amass_00.g1_pth_path, "/data/vith/amass/part_00/g1_new.pth")
-            self.assertEqual(cfg.amass_01.g1_pth_path, "/data/vith/amass/part_01/g1_new.pth")
+            self.assertEqual(cfg.amass_00.g1_pth_path, "/data/vith/amass/part_00/g1.pth")
+            self.assertEqual(cfg.amass_01.g1_pth_path, "/data/vith/amass/part_01/g1.pth")
             self.assertEqual(cfg.bedlam2_00.g1_pth_name, "g1_new.pth")
             self.assertEqual(cfg.h36m_01.g1_pth_name, "g1_new.pth")
 

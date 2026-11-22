@@ -3,7 +3,7 @@
 amass_00:
   _target_: hmr4d.dataset.pure_motion.g1_amass.G1AmassDualPthDataset
   amass_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_00/motion.pth"
-  g1_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_00/${oc.env:VITH_G1_PTH_NAME,g1.pth}"
+  g1_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_00/${oc.env:VITH_AMASS_G1_PTH_NAME,g1.pth}"
   g1_input_is_yup: true
   amass_fps: 30.0
   motion_frames: 120
@@ -24,7 +24,7 @@ amass_00:
 amass_01:
   _target_: hmr4d.dataset.pure_motion.g1_amass.G1AmassDualPthDataset
   amass_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_01/motion.pth"
-  g1_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_01/${oc.env:VITH_G1_PTH_NAME,g1.pth}"
+  g1_pth_path: "${oc.env:VITH_DATASET_ROOT,/path/to/training_set}/amass/part_01/${oc.env:VITH_AMASS_G1_PTH_NAME,g1.pth}"
   g1_input_is_yup: true
   amass_fps: 30.0
   motion_frames: 120
