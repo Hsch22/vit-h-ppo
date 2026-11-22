@@ -206,6 +206,33 @@ Additional diagnostic findings:
   reducing `exec_root_err` (`0.2057 -> 0.1977 m`) and `exec_j_mae`
   (`0.1699 -> 0.1681 rad`) while keeping `root_xy_path` identical (`2.491 m`).
 
+### Full `val` + `test` Base & GT trackability audit (`n = 5,746` clips)
+
+Using `post_training/mine_hard_clips.py` (4 H100 GPUs × 16 persistent tracker
+workers, DDIM-50 `eta=0.0`, `gt_mode=all`), 100% of `test` (`2,863` clips) and
+100% of `val` (`2,883` clips) across `h36m + bedlam + bedlam2` were evaluated
+on both Base (`vith_offline_g1.ckpt`) and ground-truth `g1_new.pth`:
+
+| Split (`n`) | Base pass | GT `g1_new` pass | Base pass \| GT pass | Base `exec_root_err` (GT) | `Bucket A` (fixable fail) | `Bucket B` (high exec err, top-20%) | `Bucket C` (easy pass) | `untrackable_gt` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `test` (`2,863`) | 97.69% (66 fail) | 94.03% (171 fail) | **99.18%** | 0.1119 m (0.1716 m) | **22** (0.77%) | **898** (31.4%) | 1,772 (61.9%) | 171 (6.0%) |
+| `val` (`2,883`) | 97.05% (85 fail) | 93.10% (199 fail) | **99.22%** | 0.1127 m (0.1818 m) | **21** (0.73%) | **894** (31.0%) | 1,769 (61.4%) | 199 (6.9%) |
+
+Key empirical observations:
+- On 120-frame in-domain windows, Base already exceeds GT `g1_new.pth` on
+  Protocol v4 pass rate (`97.7%` vs `94.0%` on `test`) and passes `74.3%`
+  (`test`) / `67.8%` (`val`) of `untrackable_gt` clips.
+- True fixable failures (`Bucket A`: GT passes, Base fails) are rare (`0.75%`)
+  and highly dynamic (`gt_jvel = 0.62–0.79 rad/s`, `gt_path = 1.26–1.51 m`,
+  ~2x faster than `Bucket C`).
+- The main large-sample optimization headroom on 120-frame windows is
+  `Bucket B` (~31% of clips, `~900` per split), where Base passes Protocol v4
+  but exhibits 2.6x larger execution root drift (`0.165 m` vs `0.063 m` in
+  `Bucket C`) and larger joint tracking error (`0.135 rad` vs `0.083 rad`).
+- Sequence length audit on `test` shows `bedlam2` (`54.9% >= 240f`, `35.0% >= 360f`,
+  max `924f`) and `h36m` (`100% >= 596f`, max `1,901f`) contain substantial
+  multi-window long-horizon trajectories where stitched drift can also be tested.
+
 ### Remaining open research questions
 
 - Uniform in-domain 120-frame sampling saturates near 98.6% Base success and
