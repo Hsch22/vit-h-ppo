@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Multi-window stitched long-horizon Diffusion-PPO v3 trainer (`ddpo_stitched_v3`).
+"""Multi-window stitched long-horizon Diffusion-PPO trainer (`ddpo_stitched_window`).
 
 Rolls out two overlapping 120-frame windows (`[0:120]` and `[119:239]`), stitches
 them into a continuous 239-frame G1 trajectory with the exact rigid endpoint
 alignment from `tools/infer_video.py`, evaluates the full 239-frame trajectory in
 the frozen SONIC/MuJoCo Protocol v4 tracker, and optimizes joint two-window
 likelihoods with explicit seam-consistency + execution + velocity-preservation
-rewards (`reward_v3`) against the frozen base pretrained denoiser.
+rewards (`stitched_seam`) against the frozen base pretrained denoiser.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from post_training import POLICY_VERSION_STITCHED, REWARD_VERSION_V3
+from post_training import POLICY_STITCHED_WINDOW, REWARD_STITCHED_SEAM
 from post_training.dataset_stitched import (
     STITCHED_TOTAL_LEN,
     STITCHED_WINDOW,
@@ -50,7 +50,7 @@ from post_training.reward import (
     RewardWeights,
     compute_group_advantages,
     compute_sample_rewards,
-    make_reward_weights_v3,
+    make_stitched_seam_reward_weights,
 )
 from post_training.stitching import stitch_two_chunks_yup
 from post_training.tracker_pool import PersistentTrackerPool
@@ -174,8 +174,8 @@ def _save_checkpoint(
     full_state = {f"pipeline.{k}": v.detach().cpu() for k, v in pipeline.state_dict().items()}
     payload = {
         "ppo_step": int(step),
-        "policy_version": POLICY_VERSION_STITCHED,
-        "reward_version": REWARD_VERSION_V3,
+        "policy_mode": POLICY_STITCHED_WINDOW,
+        "reward_mode": REWARD_STITCHED_SEAM,
         "imgfeat_encoder": "sam3d",
         "model_state_dict": full_state,
         "denoiser_state_dict": {k: v.detach().cpu() for k, v in denoiser_module.state_dict().items()},
@@ -332,7 +332,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grounding-xml", type=Path, default=REPO_ROOT / "g1_tracker/assets/g1/grounding/mjcf/g1_29dof_rev_1_0.xml")
     parser.add_argument("--tracker-workers", type=int, default=8)
 
-    # Stitched PPO v3 hyperparameters
+    # Stitched PPO hyperparameters
     parser.add_argument("--ddim-steps", type=int, default=20)
     parser.add_argument("--ddim-eta", type=float, default=0.7)
     parser.add_argument("--prompts-per-rank", type=int, default=1)
@@ -354,7 +354,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
 
-    # Reward v3 weights
+    # Stitched seam reward weights
     parser.add_argument("--w-success", type=float, default=1.0)
     parser.add_argument("--w-survival", type=float, default=0.6)
     parser.add_argument("--w-exec-root", type=float, default=1.2)
@@ -421,7 +421,7 @@ def main() -> None:
             pipeline.denoiser3d.load_state_dict(init_pipe.denoiser3d.state_dict(), strict=True)
             del init_pipe
         if is_main:
-            print(f"[PPOv3] Warm-started denoiser3d from {args.init_ckpt} (KL anchored to {args.base_ckpt})", flush=True)
+            print(f"[PPO-Stitched] Warm-started denoiser3d from {args.init_ckpt} (KL anchored to {args.base_ckpt})", flush=True)
 
     denoiser_raw = pipeline.denoiser3d.to(device).eval()
     trainable_params = [p for p in denoiser_raw.parameters() if p.requires_grad]
@@ -460,7 +460,7 @@ def main() -> None:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_step = int(ckpt["ppo_step"])
         if is_main:
-            print(f"[PPOv3] Resumed from {args.resume} at step {start_step}", flush=True)
+            print(f"[PPO-Stitched] Resumed from {args.resume} at step {start_step}", flush=True)
 
     policy = StochasticDDIMPolicy(
         pipeline=pipeline,
@@ -469,7 +469,7 @@ def main() -> None:
         use_bf16=(not args.no_bf16),
         device=device,
     )
-    reward_weights = make_reward_weights_v3(
+    reward_weights = make_stitched_seam_reward_weights(
         w_success=args.w_success,
         w_survival=args.w_survival,
         w_exec_root=args.w_exec_root,
@@ -542,8 +542,8 @@ def main() -> None:
 
     provenance = {
         "git_commit": _git_commit(),
-        "policy_version": POLICY_VERSION_STITCHED,
-        "reward_version": REWARD_VERSION_V3,
+        "policy_mode": POLICY_STITCHED_WINDOW,
+        "reward_mode": REWARD_STITCHED_SEAM,
         "base_ckpt": str(args.base_ckpt.resolve()),
         "base_ckpt_sha256": _sha256_file(args.base_ckpt.resolve()),
         "init_ckpt": str(args.init_ckpt.resolve()) if args.init_ckpt else None,
@@ -558,7 +558,7 @@ def main() -> None:
     if is_main:
         (output_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
         print(
-            f"[PPOv3] Ready: world_size={world_size}, train_pairs={len(train_ds)}, val_pairs={val_clips}, "
+            f"[PPO-Stitched] Ready: world_size={world_size}, train_pairs={len(train_ds)}, val_pairs={val_clips}, "
             f"prompts/rank={args.prompts_per_rank}, group_size={args.group_size}, "
             f"global_stitched_rollouts/step={world_size * args.prompts_per_rank * args.group_size}",
             flush=True,
@@ -571,15 +571,15 @@ def main() -> None:
         api_key = os.environ.get("SWANLAB_API_KEY")
         if api_key:
             swanlab.login(api_key=api_key, save=False)
-        exp_name = args.swanlab_exp_name or f"vith-ppo-v3-stitched-{time.strftime('%m%d-%H%M')}"
+        exp_name = args.swanlab_exp_name or f"vith-ppo-stitched-{time.strftime('%m%d-%H%M')}"
         swan_run = swanlab.init(
             project=args.swanlab_project,
             experiment_name=exp_name,
             logdir=str(output_dir / "swanlog"),
             config={
                 **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-                "policy_version": POLICY_VERSION_STITCHED,
-                "reward_version": REWARD_VERSION_V3,
+                "policy_mode": POLICY_STITCHED_WINDOW,
+                "reward_mode": REWARD_STITCHED_SEAM,
                 "world_size": world_size,
                 "train_pairs": len(train_ds),
                 "val_pairs": val_clips,
@@ -682,7 +682,7 @@ def main() -> None:
                     ratio_dev = float((torch.exp(chk_lp_joint - old_logp_joint[0]) - 1.0).abs().max().item())
                 if is_main:
                     print(
-                        f"[PPOv3 REPLAY CHECK] max|new_logp - old_logp|={max_err:.2e}, "
+                        f"[PPO-Stitched REPLAY CHECK] max|new_logp - old_logp|={max_err:.2e}, "
                         f"max|ratio - 1|={ratio_dev:.2e}, init_kl={float(chk_kl_joint.mean().item()):.2e}",
                         flush=True,
                     )
@@ -690,7 +690,7 @@ def main() -> None:
                     raise RuntimeError(f"Joint stitched replay failed: logp_err={max_err}, ratio_dev={ratio_dev}")
                 replay_verified = True
 
-            # --- C. Parallel Frozen SONIC/MuJoCo 239-Frame Tracker Feedback + reward_v3 ---
+            # --- C. Parallel Frozen SONIC/MuJoCo 239-Frame Tracker Feedback + stitched_seam reward ---
             t1 = time.perf_counter()
             jp_np = stitched["joint_pos"].cpu().numpy()
             rp_np = stitched["root_pos_w"].cpu().numpy()
@@ -770,7 +770,7 @@ def main() -> None:
                         kl_mean = kl_joint.mean()
                         loss = (pg_loss + args.kl_coef * kl_mean) / len(perm)
                         if not torch.isfinite(loss):
-                            raise RuntimeError(f"Non-finite PPOv3 loss at step {step}: {loss.item()}")
+                            raise RuntimeError(f"Non-finite stitched PPO loss at step {step}: {loss.item()}")
                         loss.backward()
 
                         ppo_losses.append(float(pg_loss.item()))
@@ -820,7 +820,7 @@ def main() -> None:
 
             if is_main:
                 print(
-                    f"[PPOv3 step={step:04d}/{args.max_steps}] "
+                    f"[PPO-Stitched step={step:04d}/{args.max_steps}] "
                     f"rew={step_metrics['train/reward_mean']:.3f} "
                     f"succ={step_metrics['train/success_rate']:.3f} "
                     f"rerr={step_metrics['train/exec_root_pos_err_m']:.4f} "

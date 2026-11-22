@@ -3,13 +3,14 @@
 ## Scope and current status
 
 The project post-trains the pretrained video-to-G1 motion generator with
-Diffusion-PPO (`ddpo_group_v1`) using feedback from a fixed SONIC ONNX +
-MuJoCo tracker. The imported release (`base/vith-release-2482c5c`) provides
-supervised diffusion training, inference, and the MuJoCo tracker; the
-`post_training/` package adds the stochastic DDIM policy adapter,
-differentiable likelihood replay, analytic KL regularization, persistent
-cross-environment tracker pool, versioned execution+fidelity reward, and
-single/multi-GPU DDP PPO trainer.
+Diffusion-PPO (`ddpo_single_window` / `ddpo_stitched_window`) using feedback
+from a fixed SONIC ONNX + MuJoCo tracker. The imported release
+(`base/vith-release-2482c5c`) provides supervised diffusion training, inference,
+and the MuJoCo tracker; the flat `post_training/` package adds the stochastic
+DDIM policy adapter, differentiable likelihood replay, analytic KL
+regularization, multi-frame overlap stitching, persistent cross-environment
+tracker pool, execution+fidelity reward modes, and single/multi-GPU DDP PPO
+trainers.
 
 The immutable import is tagged `base/vith-release-2482c5c`. A frozen copy of
 the base generator (`base_denoiser`) is retained for held-out evaluation and
@@ -162,9 +163,9 @@ These fields are observations, not an established PPO reward. They also do
 not establish equivalence to previously reported Push Success or Long
 Success protocols; those require their own documented experiments.
 
-## Implemented PPO design (`ddpo_group_v1` / `reward_v1`)
+## Implemented PPO design (`ddpo_single_window` / `decomposed_vel`)
 
-All seven design items above are resolved explicitly in `post_training/`:
+All seven design items above are resolved explicitly in the flat `post_training/` package:
 
 1. **Policy and episode (`post_training/policy.py`, `post_training/dataset.py`).**
    Each PPO episode is a single video-conditioned 120-frame motion window
@@ -199,15 +200,16 @@ All seven design items above are resolved explicitly in `post_training/`:
    zero-variance groups (`std_i <= 1e-6`) cleanly to `0`.
 
 5. **Reward and fidelity (`post_training/reward.py`).**
-   Versioned as `reward_v1`:
-   `r = w_success * 1[is_success] + w_survival * survival_ratio + w_exec_track * exp(-e_j/0.25)*exp(-e_r/0.25) + w_fidelity * (0.5*exp(-j_mae/0.30) + 0.5*exp(-b_mpjpe/0.20))`
-   with default weights `(1.0, 0.5, 0.3, 1.0)`. Fidelity compares generated
-   joints and root-relative 30-body positions against the clip's Z-up
-   reference trajectory (`g1_new.pth`), preventing stationary collapse.
-   Non-finite predictions or tracker errors receive an explicit
-   `invalid_penalty = -1.0` and are never treated as successes or silently
-   dropped. Held-out `val` splits are evaluated separately at step 0 and
-   every `--eval-every` steps.
+   Three named reward modes are supported:
+   - `combined_track`: multiplicative execution term `exp(-e_j/0.25) * exp(-e_r/0.25)` + pose fidelity (`w=(1.0, 0.5, 0.3, 1.0)`).
+   - `decomposed_vel` (default, verified best): decomposed root & joint execution terms `w_exec_root * exp(-e_r/0.15) + w_exec_joint * exp(-e_j/0.15)` + pose fidelity + angular speed fidelity `w_vel_fidelity * exp(-vel_mae/0.30)` to prevent motion over-smoothing.
+   - `stitched_seam`: adds boundary overlap & seam-jump penalties on top of `decomposed_vel` for two-window stitched rollouts.
+   Fidelity compares generated joints and root-relative 30-body positions
+   against the clip's Z-up reference trajectory (`g1_new.pth`), preventing
+   stationary collapse. Non-finite predictions or tracker errors receive an
+   explicit `invalid_penalty = -1.0` and are never treated as successes or
+   silently dropped. Held-out `val` splits are evaluated separately at step 0
+   and every `--eval-every` steps.
 
 6. **KL and update scope (`post_training/train_ppo.py`).**
    Only `pipeline.denoiser3d` parameters are trainable (`requires_grad=True`);
@@ -219,7 +221,7 @@ All seven design items above are resolved explicitly in `post_training/`:
    (`clip_eps=0.2`), `ppo_epochs=2`, and gradient clipping (`1.0`).
 
 7. **Reproducibility and compatibility (`post_training/train_ppo.py`).**
-   Every checkpoint writes `ppo_step`, `policy_version`, `reward_version`,
+   Every checkpoint writes `ppo_step`, `policy_mode`, `reward_mode`,
    `imgfeat_encoder="sam3d"`, full `pipeline.*`-prefixed `model_state_dict`
    (strictly loadable by `tools/inference_utils.py::load_pipeline()`),
    `denoiser_state_dict`, `optimizer_state_dict`, RNG states, CLI `config`,

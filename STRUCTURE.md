@@ -22,7 +22,40 @@ ViT-H-release/
 |   `-- bones_seed_g1_soma_pair_index.json
 |-- docs/
 |   |-- DATA_LAYOUT.md
-|   `-- INFERENCE.md
+|   |-- DEPLOYMENT.md
+|   |-- INFERENCE.md
+|   |-- PPO_INTEGRATION.md
+|   `-- VALIDATION.md
+|-- g1_tracker/
+|   |-- vith_tracker/
+|   |-- tools/track_g1.py
+|   `-- tests/
+|-- post_training/
+|   |-- policy.py
+|   |-- reward.py
+|   |-- stitching.py
+|   |-- dataset.py
+|   |-- dataset_stitched.py
+|   |-- tracker_pool.py
+|   |-- tracker_worker.py
+|   |-- train_ppo.py
+|   |-- train_ppo_stitched.py
+|   |-- mine_hard_clips.py
+|   |-- eval_compare.py
+|   `-- eval_long_horizon.py
+|-- scripts/
+|   |-- checkpoints.py
+|   |-- preflight.py
+|   |-- train.sh
+|   |-- train_ppo.sh
+|   |-- stage_training_set.sh
+|   `-- check_release.sh
+|-- tests/
+|   |-- test_infra_tools.py
+|   |-- test_ppo_components.py
+|   |-- test_preprocess_review_followup.py
+|   |-- test_release_inference_fixes.py
+|   `-- test_video_timeline_files.py
 |-- experiments/
 |   `-- g1_training_set_exp1/
 |       |-- hydra_config.sanitized.yaml
@@ -38,10 +71,6 @@ ViT-H-release/
 |-- inputs/
 |   `-- README.md
 |-- motion_lib/
-|-- scripts/
-|   |-- train.sh
-|   |-- stage_training_set.sh
-|   `-- check_release.sh
 |-- slurm/
 |   `-- train.sbatch
 |-- tools/
@@ -78,7 +107,15 @@ ViT-H-release/
 - `data/`: small metadata required by this experiment; no raw datasets.
 - `experiments/`: sanitized configuration emitted by the training run.
 - `motion_lib/` and `unitree_description/`: G1 forward kinematics.
-- `scripts/` and `slurm/`: data staging, training, and validation commands.
+- `post_training/`: flat single-level Diffusion-PPO package (stochastic DDIM
+  policy & replay, execution/fidelity rewards, multi-frame overlap stitching,
+  persistent cross-env SONIC/MuJoCo tracker pool, hard-clip mining, DDP
+  trainers, and paired short/long-horizon evaluators).
+- `g1_tracker/`: frozen SONIC ONNX + MuJoCo Protocol v4 tracker runtime and tests.
+- `scripts/` and `slurm/`: preflight, checkpoint verification, data staging,
+  and supervised/PPO launch scripts.
+- `tests/`: CPU-runnable regression suite covering inference, preprocessing,
+  checkpoint validation, PPO math, and multi-frame stitching.
 - `inputs/`: instructions for separately licensed preprocessing assets.
 
 ## Deliberately excluded

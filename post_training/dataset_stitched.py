@@ -1,4 +1,4 @@
-"""Multi-window (2 x 120f, 1-frame overlap = 239f) dataset & weighted sampler for PPO v3."""
+"""Multi-window (2 x 120f, 1-frame overlap = 239f) dataset & weighted sampler for stitched PPO."""
 
 from __future__ import annotations
 

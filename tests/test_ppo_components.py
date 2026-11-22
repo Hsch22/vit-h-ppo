@@ -14,8 +14,8 @@ from post_training.reward import (
     RewardWeights,
     compute_group_advantages,
     compute_sample_rewards,
-    make_reward_weights_v2,
-    make_reward_weights_v3,
+    make_decomposed_vel_reward_weights,
+    make_stitched_seam_reward_weights,
 )
 from post_training.stitching import (
     chunk_windows,
@@ -235,14 +235,14 @@ class TestPPOComponents(unittest.TestCase):
         self.assertLess(float((y_sdpa_unmasked - y_ref_unmasked).abs().max().item()), 1e-5)
         self.assertLess(float((y_sdpa_masked - y_ref_masked).abs().max().item()), 1e-5)
 
-    def test_reward_v2_root_exec_and_velocity_preservation(self) -> None:
+    def test_decomposed_vel_reward_root_exec_and_velocity_preservation(self) -> None:
         t_len = 20
         t = np.linspace(0.0, 2.0, t_len, dtype=np.float32)[:, None]
         gt_jp = np.repeat(np.sin(3.0 * t), 29, axis=1)
         gt_bp = np.zeros((t_len, 30, 3), dtype=np.float32)
 
         # Sample 0: matches GT velocity and has low root error (0.05m)
-        # Sample 1: matches GT velocity but high root error (0.25m) -> much lower reward_v2
+        # Sample 1: matches GT velocity but high root error (0.25m) -> much lower decomposed_vel reward
         # Sample 2: sluggish (0.2x amplitude -> much lower joint speed) with same low root error -> lower vel_fidelity
         pred_jp = np.stack([gt_jp, gt_jp, 0.2 * gt_jp], axis=0)
         pred_bp = np.stack([gt_bp, gt_bp, gt_bp], axis=0)
@@ -254,8 +254,8 @@ class TestPPOComponents(unittest.TestCase):
             {"valid": True, "is_success": True, "first_failure_frame_50hz": -1, "total_frames_50hz": 33, "exec_joint_mae_rad": 0.08, "exec_root_pos_err_m": 0.25},
             {"valid": True, "is_success": True, "first_failure_frame_50hz": -1, "total_frames_50hz": 33, "exec_joint_mae_rad": 0.08, "exec_root_pos_err_m": 0.05},
         ]
-        w2 = make_reward_weights_v2()
-        out = compute_sample_rewards(trk, pred_jp, pred_bp, gt_jp_b, gt_bp_b, np.array([t_len] * 3), w2, fps=30.0)
+        weights = make_decomposed_vel_reward_weights()
+        out = compute_sample_rewards(trk, pred_jp, pred_bp, gt_jp_b, gt_bp_b, np.array([t_len] * 3), weights, fps=30.0)
         # Lower root error must give substantially higher reward (> +0.5 gap under w_exec_root=1.2, scale=0.15)
         self.assertGreater(float(out["reward"][0] - out["reward"][1]), 0.5)
         # Sluggish sample must have strictly lower vel_fidelity and strictly lower reward than sample 0
@@ -304,7 +304,7 @@ class TestPPOComponents(unittest.TestCase):
             self.assertAlmostEqual(frac_b, 0.55, delta=0.02)
             self.assertAlmostEqual(frac_c, 0.25, delta=0.02)
 
-    def test_reward_v3_seam_consistency_penalty(self) -> None:
+    def test_stitched_seam_reward_consistency_penalty(self) -> None:
         t_len = 24
         gt_jp = np.zeros((3, t_len, 29), dtype=np.float32)
         gt_bp = np.zeros((3, t_len, 30, 3), dtype=np.float32)
@@ -319,9 +319,9 @@ class TestPPOComponents(unittest.TestCase):
         sj = np.array([0.010, 0.044, 0.084], dtype=np.float32)
         istep = np.array([0.014, 0.014, 0.014], dtype=np.float32)
 
-        w3 = make_reward_weights_v3()
+        weights = make_stitched_seam_reward_weights()
         out = compute_sample_rewards(
-            trk, gt_jp, gt_bp, gt_jp, gt_bp, np.array([t_len] * 3), w3, fps=30.0,
+            trk, gt_jp, gt_bp, gt_jp, gt_bp, np.array([t_len] * 3), weights, fps=30.0,
             seam_overlap_err=ov, seam_joint_jump=sj, interior_joint_step=istep,
         )
         self.assertAlmostEqual(float(out["seam_score"][0]), 1.0, places=5)

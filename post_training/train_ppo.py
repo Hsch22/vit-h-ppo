@@ -32,7 +32,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from post_training import POLICY_VERSION, REWARD_VERSION, REWARD_VERSION_V2
+from post_training import (
+    POLICY_SINGLE_WINDOW,
+    REWARD_COMBINED_TRACK,
+    REWARD_DECOMPOSED_VEL,
+)
 from post_training.dataset import (
     HardClipDistributedSampler,
     build_hard_val_subset,
@@ -44,7 +48,7 @@ from post_training.reward import (
     RewardWeights,
     compute_group_advantages,
     compute_sample_rewards,
-    make_reward_weights_v2,
+    make_decomposed_vel_reward_weights,
 )
 from post_training.tracker_pool import PersistentTrackerPool
 from tools.inference_utils import load_pipeline
@@ -108,8 +112,8 @@ def _save_checkpoint(
     full_state = {f"pipeline.{k}": v.detach().cpu() for k, v in pipeline.state_dict().items()}
     payload = {
         "ppo_step": int(step),
-        "policy_version": POLICY_VERSION,
-        "reward_version": str(getattr(args, "reward_version", REWARD_VERSION)),
+        "policy_mode": POLICY_SINGLE_WINDOW,
+        "reward_mode": str(getattr(args, "reward_mode", REWARD_DECOMPOSED_VEL)),
         "imgfeat_encoder": "sam3d",
         "model_state_dict": full_state,
         "denoiser_state_dict": {k: v.detach().cpu() for k, v in denoiser_module.state_dict().items()},
@@ -321,12 +325,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-hard-index", type=Path, default=None)
     parser.add_argument("--val-max-bucket-b", type=int, default=107)
 
-    # Reward weights (`reward_v1` or `reward_v2`)
+    # Reward weights (`combined_track` or `decomposed_vel`)
     parser.add_argument(
-        "--reward-version",
+        "--reward-mode",
         type=str,
-        default=REWARD_VERSION,
-        choices=(REWARD_VERSION, REWARD_VERSION_V2),
+        default=REWARD_DECOMPOSED_VEL,
+        choices=(REWARD_COMBINED_TRACK, REWARD_DECOMPOSED_VEL),
     )
     parser.add_argument("--w-success", type=float, default=1.0)
     parser.add_argument("--w-survival", type=float, default=0.5)
@@ -442,8 +446,8 @@ def main() -> None:
         use_bf16=(not args.no_bf16),
         device=device,
     )
-    if args.reward_version == REWARD_VERSION_V2:
-        reward_weights = make_reward_weights_v2(
+    if args.reward_mode == REWARD_DECOMPOSED_VEL:
+        reward_weights = make_decomposed_vel_reward_weights(
             w_success=args.w_success,
             w_survival=args.w_survival,
             w_exec_root=args.w_exec_root,
@@ -453,7 +457,7 @@ def main() -> None:
         )
     else:
         reward_weights = RewardWeights(
-            version=REWARD_VERSION,
+            mode=REWARD_COMBINED_TRACK,
             w_success=args.w_success,
             w_survival=args.w_survival,
             w_exec_track=args.w_exec_track,
@@ -576,8 +580,8 @@ def main() -> None:
             logdir=str(output_dir / "swanlog"),
             config={
                 **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-                "policy_version": POLICY_VERSION,
-                "reward_version": reward_weights.version,
+                "policy_mode": POLICY_SINGLE_WINDOW,
+                "reward_mode": reward_weights.mode,
                 "world_size": world_size,
                 "train_clips": len(train_ds),
                 "val_clips": val_clips,

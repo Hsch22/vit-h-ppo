@@ -1,4 +1,4 @@
-"""Versioned execution + fidelity rewards (`reward_v1`, `reward_v2`) and group advantages."""
+"""Execution + fidelity reward modes (`combined_track`, `decomposed_vel`, `stitched_seam`) and group advantages."""
 
 from __future__ import annotations
 
@@ -9,17 +9,21 @@ from typing import Any
 import numpy as np
 import torch
 
-from post_training import REWARD_VERSION, REWARD_VERSION_V2, REWARD_VERSION_V3
+from post_training import (
+    REWARD_COMBINED_TRACK,
+    REWARD_DECOMPOSED_VEL,
+    REWARD_STITCHED_SEAM,
+)
 
 
 @dataclass(frozen=True)
 class RewardWeights:
-    version: str = REWARD_VERSION
+    mode: str = REWARD_COMBINED_TRACK
     w_success: float = 1.0
     w_survival: float = 0.5
-    # reward_v1 combined execution term
+    # `combined_track` multiplicative execution term
     w_exec_track: float = 0.3
-    # reward_v2 / reward_v3 decomposed execution, seam & velocity-preservation terms
+    # `decomposed_vel` / `stitched_seam` additive root+joint execution, seam & velocity-preservation terms
     w_exec_root: float = 1.2
     w_exec_joint: float = 0.8
     w_seam: float = 0.0
@@ -34,7 +38,7 @@ class RewardWeights:
     vel_fid_scale: float = 0.30
 
 
-def make_reward_weights_v2(
+def make_decomposed_vel_reward_weights(
     w_success: float = 1.0,
     w_survival: float = 0.5,
     w_exec_root: float = 1.2,
@@ -42,9 +46,9 @@ def make_reward_weights_v2(
     w_fidelity: float = 0.4,
     w_vel_fidelity: float = 0.3,
 ) -> RewardWeights:
-    """Evidence-driven reward_v2: sharper root/joint execution terms + velocity preservation."""
+    """Decomposed root/joint execution reward with angular velocity preservation."""
     return RewardWeights(
-        version=REWARD_VERSION_V2,
+        mode=REWARD_DECOMPOSED_VEL,
         w_success=w_success,
         w_survival=w_survival,
         w_exec_track=0.0,
@@ -60,7 +64,7 @@ def make_reward_weights_v2(
     )
 
 
-def make_reward_weights_v3(
+def make_stitched_seam_reward_weights(
     w_success: float = 1.0,
     w_survival: float = 0.6,
     w_exec_root: float = 1.2,
@@ -69,9 +73,9 @@ def make_reward_weights_v3(
     w_fidelity: float = 0.4,
     w_vel_fidelity: float = 0.5,
 ) -> RewardWeights:
-    """Long-horizon stitched reward_v3: adds explicit seam consistency + stronger velocity preservation."""
+    """Two-window stitched reward adding boundary seam consistency and velocity preservation."""
     return RewardWeights(
-        version=REWARD_VERSION_V3,
+        mode=REWARD_STITCHED_SEAM,
         w_success=w_success,
         w_survival=w_survival,
         w_exec_track=0.0,
@@ -104,11 +108,10 @@ def compute_sample_rewards(
 ) -> dict[str, np.ndarray]:
     """Combine frozen SONIC tracker execution feedback with reference fidelity.
 
-    Supports `reward_v1`, `reward_v2`, and `reward_v3` (stitched long-horizon
-    reward with explicit boundary seam consistency).
+    Supports `combined_track`, `decomposed_vel`, and `stitched_seam` modes.
     """
-    if weights.version not in (REWARD_VERSION, REWARD_VERSION_V2, REWARD_VERSION_V3):
-        raise ValueError(f"Unsupported reward version: {weights.version!r}")
+    if weights.mode not in (REWARD_COMBINED_TRACK, REWARD_DECOMPOSED_VEL, REWARD_STITCHED_SEAM):
+        raise ValueError(f"Unsupported reward mode: {weights.mode!r}")
 
     n = len(tracker_results)
     fps_arr = np.full(n, float(fps), dtype=np.float32) if np.ndim(fps) == 0 else np.asarray(fps, dtype=np.float32)
@@ -188,14 +191,14 @@ def compute_sample_rewards(
             r_vfid = 1.0
         vel_fidelity[i] = r_vfid
 
-        if weights.version == REWARD_VERSION:
+        if weights.mode == REWARD_COMBINED_TRACK:
             rewards[i] = (
                 weights.w_success * (1.0 if succ else 0.0)
                 + weights.w_survival * surv
                 + weights.w_exec_track * r_trk
                 + weights.w_fidelity * r_fid
             )
-        elif weights.version == REWARD_VERSION_V2:
+        elif weights.mode == REWARD_DECOMPOSED_VEL:
             rewards[i] = (
                 weights.w_success * (1.0 if succ else 0.0)
                 + weights.w_survival * surv
