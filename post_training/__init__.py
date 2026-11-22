@@ -2,3 +2,4 @@
 
 POLICY_VERSION = "ddpo_group_v1"
 REWARD_VERSION = "reward_v1"
+REWARD_VERSION_V2 = "reward_v2"

@@ -1,4 +1,4 @@
-"""Versioned execution + fidelity reward (`reward_v1`) and group-normalized advantages."""
+"""Versioned execution + fidelity rewards (`reward_v1`, `reward_v2`) and group advantages."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from post_training import REWARD_VERSION
+from post_training import REWARD_VERSION, REWARD_VERSION_V2
 
 
 @dataclass(frozen=True)
@@ -17,13 +17,45 @@ class RewardWeights:
     version: str = REWARD_VERSION
     w_success: float = 1.0
     w_survival: float = 0.5
+    # reward_v1 combined execution term
     w_exec_track: float = 0.3
+    # reward_v2 decomposed execution & velocity-preservation terms
+    w_exec_root: float = 1.2
+    w_exec_joint: float = 0.8
     w_fidelity: float = 1.0
+    w_vel_fidelity: float = 0.0
     invalid_penalty: float = -1.0
     exec_joint_scale: float = 0.25
     exec_root_scale: float = 0.25
     fid_joint_scale: float = 0.30
     fid_body_scale: float = 0.20
+    vel_fid_scale: float = 0.30
+
+
+def make_reward_weights_v2(
+    w_success: float = 1.0,
+    w_survival: float = 0.5,
+    w_exec_root: float = 1.2,
+    w_exec_joint: float = 0.8,
+    w_fidelity: float = 0.4,
+    w_vel_fidelity: float = 0.3,
+) -> RewardWeights:
+    """Evidence-driven reward_v2: sharper root/joint execution terms + velocity preservation."""
+    return RewardWeights(
+        version=REWARD_VERSION_V2,
+        w_success=w_success,
+        w_survival=w_survival,
+        w_exec_track=0.0,
+        w_exec_root=w_exec_root,
+        w_exec_joint=w_exec_joint,
+        w_fidelity=w_fidelity,
+        w_vel_fidelity=w_vel_fidelity,
+        exec_joint_scale=0.15,
+        exec_root_scale=0.15,
+        fid_joint_scale=0.30,
+        fid_body_scale=0.20,
+        vel_fid_scale=0.30,
+    )
 
 
 def compute_sample_rewards(
@@ -34,20 +66,31 @@ def compute_sample_rewards(
     gt_body_pos_z: np.ndarray,
     lengths: np.ndarray,
     weights: RewardWeights = RewardWeights(),
+    fps: np.ndarray | float = 30.0,
 ) -> dict[str, np.ndarray]:
     """Combine frozen SONIC tracker execution feedback with reference fidelity.
 
-    Fidelity compares generated joint angles and root-relative 30-body positions
-    against the clip's Z-up reference G1 trajectory (e.g. g1_new.pth), preventing
-    the policy from maximizing tracking survival by standing still.
+    Supports both `reward_v1` (combined `w_exec_track`) and `reward_v2`
+    (separate sharper `w_exec_root`, `w_exec_joint`, plus `w_vel_fidelity`
+    to prevent joint-velocity smoothing).
     """
+    if weights.version not in (REWARD_VERSION, REWARD_VERSION_V2):
+        raise ValueError(f"Unsupported reward version: {weights.version!r}")
+
     n = len(tracker_results)
+    fps_arr = np.full(n, float(fps), dtype=np.float32) if np.ndim(fps) == 0 else np.asarray(fps, dtype=np.float32)
     rewards = np.empty(n, dtype=np.float32)
     is_success = np.zeros(n, dtype=np.bool_)
     is_valid = np.zeros(n, dtype=np.bool_)
     survival_ratio = np.zeros(n, dtype=np.float32)
     exec_track = np.zeros(n, dtype=np.float32)
+    exec_root_score = np.zeros(n, dtype=np.float32)
+    exec_joint_score = np.zeros(n, dtype=np.float32)
+    exec_joint_mae = np.full(n, np.nan, dtype=np.float32)
+    exec_root_err = np.full(n, np.nan, dtype=np.float32)
     fidelity = np.zeros(n, dtype=np.float32)
+    vel_fidelity = np.zeros(n, dtype=np.float32)
+    mean_joint_vel = np.full(n, np.nan, dtype=np.float32)
     ref_joint_mae = np.full(n, np.nan, dtype=np.float32)
     ref_body_mpjpe = np.full(n, np.nan, dtype=np.float32)
 
@@ -79,7 +122,13 @@ def compute_sample_rewards(
 
         e_j = float(trk["exec_joint_mae_rad"])
         e_r = float(trk["exec_root_pos_err_m"])
-        r_trk = math.exp(-e_j / weights.exec_joint_scale) * math.exp(-e_r / weights.exec_root_scale)
+        exec_joint_mae[i] = e_j
+        exec_root_err[i] = e_r
+        r_ej = math.exp(-e_j / weights.exec_joint_scale)
+        r_er = math.exp(-e_r / weights.exec_root_scale)
+        exec_joint_score[i] = r_ej
+        exec_root_score[i] = r_er
+        r_trk = r_ej * r_er
         exec_track[i] = r_trk
 
         # Root-relative body fidelity (invariant to global translation offset).
@@ -92,12 +141,35 @@ def compute_sample_rewards(
         r_fid = 0.5 * math.exp(-j_mae / weights.fid_joint_scale) + 0.5 * math.exp(-b_mpjpe / weights.fid_body_scale)
         fidelity[i] = r_fid
 
-        rewards[i] = (
-            weights.w_success * (1.0 if succ else 0.0)
-            + weights.w_survival * surv
-            + weights.w_exec_track * r_trk
-            + weights.w_fidelity * r_fid
-        )
+        # Joint angular speed fidelity (prevents sluggish / over-smoothed motion).
+        if t_len >= 2:
+            fps_i = float(fps_arr[i])
+            p_speed = np.abs(np.diff(p_jp, axis=0)) * fps_i
+            g_speed = np.abs(np.diff(g_jp, axis=0)) * fps_i
+            mean_joint_vel[i] = float(np.mean(p_speed))
+            vel_mae = float(np.mean(np.abs(p_speed - g_speed)))
+            r_vfid = math.exp(-vel_mae / weights.vel_fid_scale)
+        else:
+            mean_joint_vel[i] = 0.0
+            r_vfid = 1.0
+        vel_fidelity[i] = r_vfid
+
+        if weights.version == REWARD_VERSION:
+            rewards[i] = (
+                weights.w_success * (1.0 if succ else 0.0)
+                + weights.w_survival * surv
+                + weights.w_exec_track * r_trk
+                + weights.w_fidelity * r_fid
+            )
+        else:
+            rewards[i] = (
+                weights.w_success * (1.0 if succ else 0.0)
+                + weights.w_survival * surv
+                + weights.w_exec_root * r_er
+                + weights.w_exec_joint * r_ej
+                + weights.w_fidelity * r_fid
+                + weights.w_vel_fidelity * r_vfid
+            )
 
     return {
         "reward": rewards,
@@ -105,7 +177,13 @@ def compute_sample_rewards(
         "is_valid": is_valid,
         "survival_ratio": survival_ratio,
         "exec_track": exec_track,
+        "exec_root_score": exec_root_score,
+        "exec_joint_score": exec_joint_score,
+        "exec_joint_mae_rad": exec_joint_mae,
+        "exec_root_pos_err_m": exec_root_err,
         "fidelity": fidelity,
+        "vel_fidelity": vel_fidelity,
+        "mean_joint_vel_rad_s": mean_joint_vel,
         "ref_joint_mae_rad": ref_joint_mae,
         "ref_body_mpjpe_m": ref_body_mpjpe,
     }

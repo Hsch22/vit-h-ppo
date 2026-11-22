@@ -32,10 +32,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from post_training import POLICY_VERSION, REWARD_VERSION
-from post_training.dataset import build_video_ppo_dataset
-from post_training.policy import StochasticDDIMPolicy, decode_x0_to_g1_zup
-from post_training.reward import RewardWeights, compute_group_advantages, compute_sample_rewards
+from post_training import POLICY_VERSION, REWARD_VERSION, REWARD_VERSION_V2
+from post_training.dataset import (
+    HardClipDistributedSampler,
+    build_hard_val_subset,
+    build_video_ppo_dataset,
+)
+from post_training.eval_compare import sample_ddim_paired
+from post_training.policy import G1_PRED_X_DIM, StochasticDDIMPolicy, decode_x0_to_g1_zup
+from post_training.reward import (
+    RewardWeights,
+    compute_group_advantages,
+    compute_sample_rewards,
+    make_reward_weights_v2,
+)
 from post_training.tracker_pool import PersistentTrackerPool
 from tools.inference_utils import load_pipeline
 
@@ -99,7 +109,7 @@ def _save_checkpoint(
     payload = {
         "ppo_step": int(step),
         "policy_version": POLICY_VERSION,
-        "reward_version": REWARD_VERSION,
+        "reward_version": str(getattr(args, "reward_version", REWARD_VERSION)),
         "imgfeat_encoder": "sam3d",
         "model_state_dict": full_state,
         "denoiser_state_dict": {k: v.detach().cpu() for k, v in denoiser_module.state_dict().items()},
@@ -130,23 +140,28 @@ def run_validation(
     device: torch.device,
     max_batches: int,
     seed: int,
+    eval_ddim_steps: int = 50,
+    eval_ddim_eta: float = 0.0,
+    val_bucket_a_mask: np.ndarray | None = None,
 ) -> dict[str, float]:
-    """Evaluate current policy on held-out validation clips (separate from training reward)."""
+    """Evaluate current policy on held-out validation clips (deployment DDIM-50 eta=0.0 by default)."""
     denoiser.eval()
     gen = torch.Generator(device=device).manual_seed(seed)
-    totals = {
-        "count": 0.0,
-        "valid": 0.0,
-        "success": 0.0,
-        "survival": 0.0,
-        "exec_track": 0.0,
-        "fidelity": 0.0,
-        "joint_mae": 0.0,
-        "body_mpjpe": 0.0,
-        "reward": 0.0,
-    }
+    all_valid_flags: list[bool] = []
+    all_succ: list[bool] = []
+    all_surv: list[float] = []
+    all_exec_trk: list[float] = []
+    all_exec_rerr: list[float] = []
+    all_exec_jmae: list[float] = []
+    all_fid: list[float] = []
+    all_vfid: list[float] = []
+    all_jvel: list[float] = []
+    all_ref_jmae: list[float] = []
+    all_ref_mpjpe: list[float] = []
+    all_rew: list[float] = []
+
     for batch_idx, batch in enumerate(val_loader):
-        if batch_idx >= max_batches:
+        if max_batches > 0 and batch_idx >= max_batches:
             break
         batch_gpu = {
             k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
@@ -154,18 +169,28 @@ def run_validation(
         }
         batch_gpu["mask"] = {"f_imgseq": batch_gpu["f_imgseq_mask"]}
         f_cond, length, all_valid = policy.build_condition(pipeline, batch_gpu)
-        rollout = policy.rollout_group(
+        bsz, seq_len, _ = f_cond.shape
+        x_init = torch.randn((bsz, seq_len, G1_PRED_X_DIM), device=device, dtype=torch.float32, generator=gen)
+        step_noises = (
+            [torch.randn((bsz, seq_len, G1_PRED_X_DIM), device=device, dtype=torch.float32, generator=gen) for _ in range(eval_ddim_steps)]
+            if eval_ddim_eta > 0.0
+            else None
+        )
+        x_0 = sample_ddim_paired(
+            pipeline=pipeline,
             denoiser=denoiser,
-            base_denoiser=base_denoiser,
             f_cond=f_cond,
             length=length,
-            group_size=1,
+            x_init=x_init,
+            ddim_steps=eval_ddim_steps,
+            eta=eval_ddim_eta,
             all_valid_length=all_valid,
-            generator=gen,
+            use_bf16=policy.use_bf16,
+            step_noises=step_noises,
         )
         decoded = decode_x0_to_g1_zup(
             pipeline=pipeline,
-            x_0=rollout.x_0,
+            x_0=x_0,
             cam_angvel=batch_gpu["cam_angvel"],
             length=length,
             root_pos_0_yup=batch_gpu["root_pos_0_yup"],
@@ -185,33 +210,53 @@ def run_validation(
             gt_body_pos_z=batch["gt_body_pos_z"].numpy(),
             lengths=lens,
             weights=reward_weights,
+            fps=fps_np,
         )
-        n = len(trk_res)
-        valid_mask = scored["is_valid"]
-        n_valid = int(valid_mask.sum())
-        totals["count"] += n
-        totals["valid"] += n_valid
-        totals["success"] += float(scored["is_success"].sum())
-        totals["survival"] += float(scored["survival_ratio"].sum())
-        totals["exec_track"] += float(scored["exec_track"].sum())
-        totals["fidelity"] += float(scored["fidelity"].sum())
-        totals["reward"] += float(scored["reward"].sum())
-        if n_valid > 0:
-            totals["joint_mae"] += float(np.nansum(scored["ref_joint_mae_rad"][valid_mask]))
-            totals["body_mpjpe"] += float(np.nansum(scored["ref_body_mpjpe_m"][valid_mask]))
+        all_valid_flags.extend(scored["is_valid"].tolist())
+        all_succ.extend(scored["is_success"].tolist())
+        all_surv.extend(scored["survival_ratio"].tolist())
+        all_exec_trk.extend(scored["exec_track"].tolist())
+        all_exec_rerr.extend(scored["exec_root_pos_err_m"].tolist())
+        all_exec_jmae.extend(scored["exec_joint_mae_rad"].tolist())
+        all_fid.extend(scored["fidelity"].tolist())
+        all_vfid.extend(scored["vel_fidelity"].tolist())
+        all_jvel.extend(scored["mean_joint_vel_rad_s"].tolist())
+        all_ref_jmae.extend(scored["ref_joint_mae_rad"].tolist())
+        all_ref_mpjpe.extend(scored["ref_body_mpjpe_m"].tolist())
+        all_rew.extend(scored["reward"].tolist())
 
-    denom = max(totals["count"], 1.0)
-    v_denom = max(totals["valid"], 1.0)
-    return {
-        "val/success_rate": totals["success"] / denom,
-        "val/survival_ratio": totals["survival"] / denom,
-        "val/exec_track": totals["exec_track"] / denom,
-        "val/fidelity": totals["fidelity"] / denom,
-        "val/ref_joint_mae_rad": totals["joint_mae"] / v_denom,
-        "val/ref_body_mpjpe_m": totals["body_mpjpe"] / v_denom,
-        "val/invalid_rate": 1.0 - (totals["valid"] / denom),
-        "val/reward_mean": totals["reward"] / denom,
+    n = max(len(all_succ), 1)
+    valid_arr = np.asarray(all_valid_flags, dtype=np.bool_)
+    def _vmean(arr_list: list[float]) -> float:
+        a = np.asarray(arr_list, dtype=np.float64)
+        return float(np.nanmean(a[valid_arr])) if valid_arr.any() else 0.0
+
+    out = {
+        "val/success_rate": float(np.sum(all_succ)) / n,
+        "val/survival_ratio": float(np.sum(all_surv)) / n,
+        "val/exec_track": float(np.sum(all_exec_trk)) / n,
+        "val/exec_root_pos_err_m": _vmean(all_exec_rerr),
+        "val/exec_joint_mae_rad": _vmean(all_exec_jmae),
+        "val/fidelity": float(np.sum(all_fid)) / n,
+        "val/vel_fidelity": float(np.sum(all_vfid)) / n,
+        "val/mean_joint_vel_rad_s": _vmean(all_jvel),
+        "val/ref_joint_mae_rad": _vmean(all_ref_jmae),
+        "val/ref_body_mpjpe_m": _vmean(all_ref_mpjpe),
+        "val/invalid_rate": 1.0 - (float(valid_arr.sum()) / n),
+        "val/reward_mean": float(np.sum(all_rew)) / n,
     }
+    if val_bucket_a_mask is not None and len(all_succ) > 0:
+        m = val_bucket_a_mask[: len(all_succ)]
+        if m.any():
+            out["val_bucket_a/success_rate"] = float(np.mean(np.asarray(all_succ, dtype=np.float64)[m]))
+            out["val_bucket_a/survival_ratio"] = float(np.mean(np.asarray(all_surv, dtype=np.float64)[m]))
+            out["val_bucket_a/exec_root_pos_err_m"] = float(np.nanmean(np.asarray(all_exec_rerr, dtype=np.float64)[m]))
+        mb = ~m
+        if mb.any():
+            out["val_bucket_b/success_rate"] = float(np.mean(np.asarray(all_succ, dtype=np.float64)[mb]))
+            out["val_bucket_b/exec_root_pos_err_m"] = float(np.nanmean(np.asarray(all_exec_rerr, dtype=np.float64)[mb]))
+            out["val_bucket_b/exec_joint_mae_rad"] = float(np.nanmean(np.asarray(all_exec_jmae, dtype=np.float64)[mb]))
+    return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -256,19 +301,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument("--kl-coef", type=float, default=0.04)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--min-lr", type=float, default=0.0)
+    parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--eval-every", type=int, default=25)
     parser.add_argument("--eval-batches", type=int, default=4)
+    parser.add_argument("--eval-ddim-steps", type=int, default=50)
+    parser.add_argument("--eval-ddim-eta", type=float, default=0.0)
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
 
-    # Reward weights (reward_v1)
+    # Hard-clip weighted sampling & hard validation index (from mine_hard_clips.py)
+    parser.add_argument("--hard-index", type=Path, default=None)
+    parser.add_argument("--share-a", type=float, default=0.20)
+    parser.add_argument("--share-b", type=float, default=0.55)
+    parser.add_argument("--share-c", type=float, default=0.25)
+    parser.add_argument("--val-hard-index", type=Path, default=None)
+    parser.add_argument("--val-max-bucket-b", type=int, default=107)
+
+    # Reward weights (`reward_v1` or `reward_v2`)
+    parser.add_argument(
+        "--reward-version",
+        type=str,
+        default=REWARD_VERSION,
+        choices=(REWARD_VERSION, REWARD_VERSION_V2),
+    )
     parser.add_argument("--w-success", type=float, default=1.0)
     parser.add_argument("--w-survival", type=float, default=0.5)
     parser.add_argument("--w-exec-track", type=float, default=0.3)
+    parser.add_argument("--w-exec-root", type=float, default=1.2)
+    parser.add_argument("--w-exec-joint", type=float, default=0.8)
     parser.add_argument("--w-fidelity", type=float, default=1.0)
+    parser.add_argument("--w-vel-fidelity", type=float, default=0.3)
 
     # Hopper H100 optimizations
     parser.add_argument("--no-bf16", action="store_true")
@@ -376,22 +442,35 @@ def main() -> None:
         use_bf16=(not args.no_bf16),
         device=device,
     )
-    reward_weights = RewardWeights(
-        w_success=args.w_success,
-        w_survival=args.w_survival,
-        w_exec_track=args.w_exec_track,
-        w_fidelity=args.w_fidelity,
-    )
+    if args.reward_version == REWARD_VERSION_V2:
+        reward_weights = make_reward_weights_v2(
+            w_success=args.w_success,
+            w_survival=args.w_survival,
+            w_exec_root=args.w_exec_root,
+            w_exec_joint=args.w_exec_joint,
+            w_fidelity=args.w_fidelity,
+            w_vel_fidelity=args.w_vel_fidelity,
+        )
+    else:
+        reward_weights = RewardWeights(
+            version=REWARD_VERSION,
+            w_success=args.w_success,
+            w_survival=args.w_survival,
+            w_exec_track=args.w_exec_track,
+            w_fidelity=args.w_fidelity,
+        )
 
     # 2. Build video-conditioned train & held-out val splits.
+    use_hard_mining = args.hard_index is not None
     train_ds = build_video_ppo_dataset(
         dataset_root=args.dataset_root,
         sources=args.sources,
         split="train",
         g1_pth_name=args.g1_pth_name,
         split_seed=args.seed,
+        deterministic_windows=use_hard_mining,
     )
-    val_ds = (
+    val_ds_full = (
         build_video_ppo_dataset(
             dataset_root=args.dataset_root,
             sources=args.sources,
@@ -402,11 +481,39 @@ def main() -> None:
         if is_main
         else None
     )
-    train_sampler = (
-        DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
-        if world_size > 1
-        else None
-    )
+    val_bucket_a_mask: np.ndarray | None = None
+    if val_ds_full is not None and args.val_hard_index is not None:
+        val_ds, val_bucket_a_mask = build_hard_val_subset(
+            val_ds_full, args.val_hard_index, max_bucket_b=args.val_max_bucket_b, seed=args.seed
+        )
+    else:
+        val_ds = val_ds_full
+
+    if use_hard_mining:
+        train_sampler: Any = HardClipDistributedSampler(
+            hard_index_path=args.hard_index,
+            dataset_len=len(train_ds),
+            num_replicas=world_size,
+            rank=rank,
+            share_a=args.share_a,
+            share_b=args.share_b,
+            share_c=args.share_c,
+            num_samples_per_epoch=max(len(train_ds), args.max_steps * args.prompts_per_rank * world_size),
+            seed=args.seed,
+        )
+        if is_main:
+            print(
+                f"[HardSampler] buckets={train_sampler.bucket_counts} "
+                f"excluded_untrackable_gt={train_sampler.excluded_untrackable} "
+                f"shares=({args.share_a:.2f}, {args.share_b:.2f}, {args.share_c:.2f})",
+                flush=True,
+            )
+    else:
+        train_sampler = (
+            DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
+            if world_size > 1
+            else None
+        )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.prompts_per_rank,
@@ -416,10 +523,11 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
+    val_batch_size = 16 if args.val_hard_index is not None else args.prompts_per_rank
     val_loader = (
         DataLoader(
             val_ds,
-            batch_size=args.prompts_per_rank,
+            batch_size=val_batch_size,
             shuffle=False,
             num_workers=min(2, args.num_data_workers),
             pin_memory=(device.type == "cuda"),
@@ -469,7 +577,7 @@ def main() -> None:
             config={
                 **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                 "policy_version": POLICY_VERSION,
-                "reward_version": REWARD_VERSION,
+                "reward_version": reward_weights.version,
                 "world_size": world_size,
                 "train_clips": len(train_ds),
                 "val_clips": val_clips,
@@ -495,7 +603,8 @@ def main() -> None:
     metrics_jsonl = (output_dir / "metrics.jsonl").open("a", encoding="utf-8") if is_main else None
     try:
         # Baseline held-out evaluation at start_step (rank 0) so SwanLab has base reference point!
-        if is_main and args.eval_batches > 0:
+        if is_main and (args.eval_batches > 0 or args.val_hard_index is not None):
+            val_max_b = 0 if args.val_hard_index is not None else args.eval_batches
             val_metrics = run_validation(
                 pipeline=pipeline,
                 denoiser=denoiser_raw,
@@ -505,8 +614,11 @@ def main() -> None:
                 tracker_pool=tracker_pool,
                 reward_weights=reward_weights,
                 device=device,
-                max_batches=args.eval_batches,
+                max_batches=val_max_b,
                 seed=args.seed + 10000,
+                eval_ddim_steps=args.eval_ddim_steps,
+                eval_ddim_eta=args.eval_ddim_eta,
+                val_bucket_a_mask=val_bucket_a_mask,
             )
             print(f"[VAL step={start_step}] {json.dumps(val_metrics)}", flush=True)
             if swan_run is not None:
@@ -609,11 +721,25 @@ def main() -> None:
                 gt_body_pos_z=gt_bp_rep,
                 lengths=lens_np,
                 weights=reward_weights,
+                fps=fps_rep,
             )
             tracker_s = time.perf_counter() - t1
 
             rewards_t = torch.from_numpy(scored["reward"]).to(device=device, dtype=torch.float32)
             advantages = compute_group_advantages(rewards_t, group_size=args.group_size)
+
+            # Optional linear warmup + cosine LR decay.
+            if args.min_lr > 0.0 or args.warmup_steps > 0:
+                if args.warmup_steps > 0 and step <= args.warmup_steps:
+                    cur_lr = args.lr * (step / max(args.warmup_steps, 1))
+                else:
+                    prog = (step - args.warmup_steps) / max(args.max_steps - args.warmup_steps, 1)
+                    prog = min(max(prog, 0.0), 1.0)
+                    cur_lr = args.min_lr + 0.5 * (args.lr - args.min_lr) * (1.0 + math.cos(math.pi * prog))
+                for pg in optimizer.param_groups:
+                    pg["lr"] = cur_lr
+            else:
+                cur_lr = args.lr
 
             # --- D. Differentiable PPO Clipped Surrogate + Analytic KL Updates ---
             t2 = time.perf_counter()
@@ -670,21 +796,23 @@ def main() -> None:
 
             # --- E. Aggregate Metrics Across Ranks & Log to SwanLab ---
             valid_mask = scored["is_valid"]
-            valid_joint_mae = (
-                float(np.nanmean(scored["ref_joint_mae_rad"][valid_mask])) if valid_mask.any() else 0.0
-            )
-            valid_body_mpjpe = (
-                float(np.nanmean(scored["ref_body_mpjpe_m"][valid_mask])) if valid_mask.any() else 0.0
-            )
+            def _valid_avg(arr: np.ndarray) -> float:
+                return float(np.nanmean(arr[valid_mask])) if valid_mask.any() else 0.0
+
             step_metrics = {
+                "train/lr": float(cur_lr),
                 "train/reward_mean": _all_reduce_mean(float(scored["reward"].mean()), device, world_size),
                 "train/reward_std": _all_reduce_mean(float(scored["reward"].std()), device, world_size),
                 "train/success_rate": _all_reduce_mean(float(scored["is_success"].mean()), device, world_size),
                 "train/survival_ratio": _all_reduce_mean(float(scored["survival_ratio"].mean()), device, world_size),
                 "train/exec_track": _all_reduce_mean(float(scored["exec_track"].mean()), device, world_size),
+                "train/exec_root_pos_err_m": _all_reduce_mean(_valid_avg(scored["exec_root_pos_err_m"]), device, world_size),
+                "train/exec_joint_mae_rad": _all_reduce_mean(_valid_avg(scored["exec_joint_mae_rad"]), device, world_size),
                 "train/fidelity": _all_reduce_mean(float(scored["fidelity"].mean()), device, world_size),
-                "train/ref_joint_mae_rad": _all_reduce_mean(valid_joint_mae, device, world_size),
-                "train/ref_body_mpjpe_m": _all_reduce_mean(valid_body_mpjpe, device, world_size),
+                "train/vel_fidelity": _all_reduce_mean(float(scored["vel_fidelity"].mean()), device, world_size),
+                "train/mean_joint_vel_rad_s": _all_reduce_mean(_valid_avg(scored["mean_joint_vel_rad_s"]), device, world_size),
+                "train/ref_joint_mae_rad": _all_reduce_mean(_valid_avg(scored["ref_joint_mae_rad"]), device, world_size),
+                "train/ref_body_mpjpe_m": _all_reduce_mean(_valid_avg(scored["ref_body_mpjpe_m"]), device, world_size),
                 "train/invalid_rate": _all_reduce_mean(1.0 - float(valid_mask.mean()), device, world_size),
                 "train/pg_loss": _all_reduce_mean(float(np.mean(ppo_losses)), device, world_size),
                 "train/kl_div": _all_reduce_mean(float(np.mean(kl_vals)), device, world_size),
@@ -703,10 +831,11 @@ def main() -> None:
                     f"[PPO step={step:04d}/{args.max_steps}] "
                     f"rew={step_metrics['train/reward_mean']:.3f} "
                     f"succ={step_metrics['train/success_rate']:.3f} "
-                    f"surv={step_metrics['train/survival_ratio']:.3f} "
+                    f"rerr={step_metrics['train/exec_root_pos_err_m']:.4f} "
+                    f"jmae={step_metrics['train/exec_joint_mae_rad']:.4f} "
                     f"fid={step_metrics['train/fidelity']:.3f} "
+                    f"vfid={step_metrics['train/vel_fidelity']:.3f} "
                     f"kl={step_metrics['train/kl_div']:.4f} "
-                    f"ratio={step_metrics['train/ratio_mean']:.4f} "
                     f"clip={step_metrics['train/clip_frac']:.3f} "
                     f"gnorm={step_metrics['train/grad_norm']:.3f} | "
                     f"roll={rollout_s:.2f}s trk={tracker_s:.2f}s upd={update_s:.2f}s",
@@ -720,7 +849,8 @@ def main() -> None:
 
             # Periodic held-out evaluation
             if args.eval_every > 0 and step % args.eval_every == 0:
-                if is_main and args.eval_batches > 0:
+                if is_main and (args.eval_batches > 0 or args.val_hard_index is not None):
+                    val_max_b = 0 if args.val_hard_index is not None else args.eval_batches
                     val_metrics = run_validation(
                         pipeline=pipeline,
                         denoiser=denoiser_raw,
@@ -730,8 +860,11 @@ def main() -> None:
                         tracker_pool=tracker_pool,
                         reward_weights=reward_weights,
                         device=device,
-                        max_batches=args.eval_batches,
+                        max_batches=val_max_b,
                         seed=args.seed + 10000,
+                        eval_ddim_steps=args.eval_ddim_steps,
+                        eval_ddim_eta=args.eval_ddim_eta,
+                        val_bucket_a_mask=val_bucket_a_mask,
                     )
                     print(f"[VAL step={step}] {json.dumps(val_metrics)}", flush=True)
                     if swan_run is not None:

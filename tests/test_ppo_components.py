@@ -10,7 +10,12 @@ import torch
 import torch.nn as nn
 
 from post_training.policy import StochasticDDIMPolicy, build_ddim_schedule
-from post_training.reward import RewardWeights, compute_group_advantages, compute_sample_rewards
+from post_training.reward import (
+    RewardWeights,
+    compute_group_advantages,
+    compute_sample_rewards,
+    make_reward_weights_v2,
+)
 
 try:
     from hmr4d.network.base_arch.transformer.encoder_rope import RoPEAttention
@@ -222,6 +227,75 @@ class TestPPOComponents(unittest.TestCase):
 
         self.assertLess(float((y_sdpa_unmasked - y_ref_unmasked).abs().max().item()), 1e-5)
         self.assertLess(float((y_sdpa_masked - y_ref_masked).abs().max().item()), 1e-5)
+
+    def test_reward_v2_root_exec_and_velocity_preservation(self) -> None:
+        t_len = 20
+        t = np.linspace(0.0, 2.0, t_len, dtype=np.float32)[:, None]
+        gt_jp = np.repeat(np.sin(3.0 * t), 29, axis=1)
+        gt_bp = np.zeros((t_len, 30, 3), dtype=np.float32)
+
+        # Sample 0: matches GT velocity and has low root error (0.05m)
+        # Sample 1: matches GT velocity but high root error (0.25m) -> much lower reward_v2
+        # Sample 2: sluggish (0.2x amplitude -> much lower joint speed) with same low root error -> lower vel_fidelity
+        pred_jp = np.stack([gt_jp, gt_jp, 0.2 * gt_jp], axis=0)
+        pred_bp = np.stack([gt_bp, gt_bp, gt_bp], axis=0)
+        gt_jp_b = np.stack([gt_jp, gt_jp, gt_jp], axis=0)
+        gt_bp_b = np.stack([gt_bp, gt_bp, gt_bp], axis=0)
+
+        trk = [
+            {"valid": True, "is_success": True, "first_failure_frame_50hz": -1, "total_frames_50hz": 33, "exec_joint_mae_rad": 0.08, "exec_root_pos_err_m": 0.05},
+            {"valid": True, "is_success": True, "first_failure_frame_50hz": -1, "total_frames_50hz": 33, "exec_joint_mae_rad": 0.08, "exec_root_pos_err_m": 0.25},
+            {"valid": True, "is_success": True, "first_failure_frame_50hz": -1, "total_frames_50hz": 33, "exec_joint_mae_rad": 0.08, "exec_root_pos_err_m": 0.05},
+        ]
+        w2 = make_reward_weights_v2()
+        out = compute_sample_rewards(trk, pred_jp, pred_bp, gt_jp_b, gt_bp_b, np.array([t_len] * 3), w2, fps=30.0)
+        # Lower root error must give substantially higher reward (> +0.5 gap under w_exec_root=1.2, scale=0.15)
+        self.assertGreater(float(out["reward"][0] - out["reward"][1]), 0.5)
+        # Sluggish sample must have strictly lower vel_fidelity and strictly lower reward than sample 0
+        self.assertLess(float(out["vel_fidelity"][2]), float(out["vel_fidelity"][0]) - 0.5)
+        self.assertLess(float(out["reward"][2]), float(out["reward"][0]) - 0.2)
+
+    def test_hard_clip_distributed_sampler_excludes_untrackable_gt(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        try:
+            from post_training.dataset import HardClipDistributedSampler
+        except ImportError:
+            self.skipTest("dataset deps unavailable in minimal CPU test env")
+
+        payload = {
+            "buckets": {
+                "bucket_a_fixable_fail": [{"global_idx": i} for i in range(0, 10)],
+                "bucket_b_high_exec_err": [{"global_idx": i} for i in range(10, 110)],
+                "bucket_c_easy_pass": [{"global_idx": i} for i in range(110, 310)],
+                "untrackable_gt": [{"global_idx": i} for i in range(310, 360)],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            idx_path = Path(tmp) / "hard_index.json"
+            idx_path.write_text(json.dumps(payload))
+            sampler = HardClipDistributedSampler(
+                idx_path,
+                dataset_len=360,
+                num_replicas=2,
+                rank=0,
+                share_a=0.20,
+                share_b=0.55,
+                share_c=0.25,
+                num_samples_per_epoch=20000,
+                seed=7,
+            )
+            draws = list(sampler)
+            self.assertEqual(len(draws), 10000)
+            self.assertEqual(sum(1 for d in draws if d >= 310), 0)
+            frac_a = sum(1 for d in draws if 0 <= d < 10) / len(draws)
+            frac_b = sum(1 for d in draws if 10 <= d < 110) / len(draws)
+            frac_c = sum(1 for d in draws if 110 <= d < 310) / len(draws)
+            self.assertAlmostEqual(frac_a, 0.20, delta=0.02)
+            self.assertAlmostEqual(frac_b, 0.55, delta=0.02)
+            self.assertAlmostEqual(frac_c, 0.25, delta=0.02)
 
 
 if __name__ == "__main__":
