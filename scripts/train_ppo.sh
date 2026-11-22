@@ -24,7 +24,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/outputs/ppo_run_$(date +%Y%m%d_%H%M%S)}"
 SOURCES="${PPO_SOURCES:-h36m bedlam bedlam2}"
 G1_PTH_NAME="${VITH_G1_PTH_NAME:-g1_new.pth}"
 TRACKER_WORKERS="${PPO_TRACKER_WORKERS:-10}"
-SWANLAB_PROJECT="${SWANLAB_PROJECT:-vit-h-ppo}"
+PPO_SWANLAB_PROJECT="${PPO_SWANLAB_PROJECT:-vit-h-ppo}"
+# SwanLab >=0.10 reserves SWANLAB_PROJECT for JSON-encoded nested project settings.
+unset SWANLAB_PROJECT
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
@@ -52,5 +54,5 @@ exec "${TORCHRUN_BIN}" \
   --output-dir "${OUTPUT_DIR}" \
   --tracker-python "${TRACKER_PYTHON_BIN}" \
   --tracker-workers "${TRACKER_WORKERS}" \
-  --swanlab-project "${SWANLAB_PROJECT}" \
+  --swanlab-project "${PPO_SWANLAB_PROJECT}" \
   "$@"
