@@ -37,17 +37,23 @@ class RoPEAttention(nn.Module):
         xq = self.rope.rotate_queries_or_keys(xq)  # B, N, L, C
         xk = self.rope.rotate_queries_or_keys(xk)  # B, N, L, C
 
-        attn_score = einsum(xq, xk, "b n i c, b n j c -> b n i j") / math.sqrt(self.head_dim)
-        if attn_mask is not None:
-            attn_mask = attn_mask.reshape(1, 1, L, L).expand(B, self.num_heads, -1, -1)
-            attn_score = attn_score.masked_fill(attn_mask, float("-inf"))
-        if key_padding_mask is not None:
-            key_padding_mask = key_padding_mask.reshape(B, 1, 1, L).expand(-1, self.num_heads, L, -1)
-            attn_score = attn_score.masked_fill(key_padding_mask, float("-inf"))
+        sdpa_mask = None
+        if attn_mask is not None and key_padding_mask is not None:
+            # Both input masks use True = masked out; SDPA bool mask uses True = attend.
+            sdpa_mask = (~attn_mask.reshape(1, 1, L, L)) & (~key_padding_mask.reshape(B, 1, 1, L))
+        elif attn_mask is not None:
+            sdpa_mask = ~attn_mask.reshape(1, 1, L, L)
+        elif key_padding_mask is not None:
+            sdpa_mask = ~key_padding_mask.reshape(B, 1, 1, L)
 
-        attn_score = torch.softmax(attn_score, dim=-1)
-        attn_score = self.dropout(attn_score)
-        output = einsum(attn_score, xv, "b n i j, b n j c -> b n i c")  # B, N, L, C
+        dropout_p = self.dropout.p if self.training else 0.0
+        output = F.scaled_dot_product_attention(
+            xq,
+            xk,
+            xv,
+            attn_mask=sdpa_mask,
+            dropout_p=dropout_p,
+        )  # B, N, L, C
         output = output.transpose(1, 2).reshape(B, L, -1)  # B, L, C
         output = self.proj(output)  # B, L, C
         return output

@@ -250,6 +250,7 @@ class NetworkEncoderRoPE(nn.Module):
         timesteps=None,
         real=None,
         gt_motion=None,
+        all_valid_length=False,
     ):
         """
         Args:
@@ -283,9 +284,11 @@ class NetworkEncoderRoPE(nn.Module):
         if xt is not None:
             x = self.add_cond_linear(torch.cat([x, xt], dim=-1))  # fuse noisy motion
 
-        # Setup length and make padding mask
+        # Setup length and make padding mask.
+        # When all_valid_length=True (e.g. fixed-window rollouts), omit key_padding_mask
+        # so SDPA dispatches directly to the mask-free FlashAttention-2 kernel on Hopper.
         assert B == length.size(0)
-        pmask = ~length_to_mask(length, L)  # (B, L)
+        pmask = None if all_valid_length else (~length_to_mask(length, L))  # (B, L)
 
         if L > self.max_len:
             attnmask = torch.ones((L, L), device=x.device, dtype=torch.bool)
@@ -305,7 +308,10 @@ class NetworkEncoderRoPE(nn.Module):
         # Output
         sample = self.final_layer(x)  # (B, L, C)
         if self.avgbeta:
-            betas = (sample[..., 126:136] * (~pmask[..., None])).sum(1) / length[:, None].clamp(min=1)  # (B, C)
+            if pmask is None:
+                betas = sample[..., 126:136].mean(dim=1)  # (B, C)
+            else:
+                betas = (sample[..., 126:136] * (~pmask[..., None])).sum(1) / length[:, None].clamp(min=1)  # (B, C)
             betas = repeat(betas, "b c -> b l c", l=L)
             sample = torch.cat([sample[..., :126], betas, sample[..., 136:]], dim=-1)
 
