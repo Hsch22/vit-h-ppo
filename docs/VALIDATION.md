@@ -259,10 +259,44 @@ Key empirical findings:
   consistent positive direction on long sequences (`+5/-2` overall, `+2/-0` on
   `600+f`, `exec_root_err` `-8.1 mm` overall and `-176 mm` on `600+f`).
 
+### PPO v2 (`reward_v2` + hard-clip mining, 1,500 steps, 8-GPU DDP) untouched `test` evaluation
+
+Full `train`-split mining (`51,485` clips, 8 GPUs × 12 workers, `41.2` min)
+yielded `407` `Bucket A` fixable failures, `16,351` `Bucket B` high-error clips,
+`32,327` `Bucket C` easy clips, and `2,400` `untrackable_gt` clips (excluded).
+8-GPU DDP PPO v2 (`reward_v2`, `shares=(0.20, 0.55, 0.25)`, `group_size=8`,
+`kl_coef=0.01`, `lr=2.5e-5 -> 5e-6` cosine, `1,500` steps) completed cleanly
+(`5.94 s/step`, replay error `9.78e-06`).
+
+Untouched `test` benchmark comparison (all evaluated in exact released
+deployment mode `DDIM-50, eta=0.0` with identical noise seeds and frozen
+Protocol v4 SONIC/MuJoCo tracker):
+
+| Benchmark (`DDIM-50 eta=0.0`) | Base | PPO-v1 (`500`) | PPO-v2 (`450`) | PPO-v2 (`900`) | PPO-v2 (`1200`) | PPO-v2 (`1500`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `denoiser3d` rel. weight shift `\|\|dW\|\|_2/\|\|W\|\|_2` | `0.000%` | `0.109%` | `0.216%` | `0.263%` | `0.269%` | `0.272%` |
+| `test` Bucket A (`n=22`) pass (`surv`) | `3/22` (`0.551`) | `3/22` (`0.523`) | `5/22` (`0.605`) | **`7/22`** (`0.644`) | `6/22` (**`0.675`**) | `4/22` (`0.592`) |
+| `test` Bucket B (`n=200`) `exec_root_err` (`jmae`) | `0.1658 m` (`0.1341`) | `0.1645 m` (`0.1328`) | `0.1618 m` (`0.1321`) | **`0.1591 m`** (`0.1319`) | `0.1627 m` (**`0.1315`**) | `0.1602 m` (`0.1316`) |
+| `test` 640-clip pass (`fixed/regressed`) | `98.59%` (`631/640`) | `98.59%` (`+0/-0`) | **`98.91%`** (`+2/-0`) | — | **`98.91%`** (`+2/-0`) | — |
+| `test` 640-clip median `Δ exec_root_err` (`% better`) | — | `+0.93 mm` (`38.3%`) | `+0.79 mm` (`45.5%`) | — | **`-0.85 mm`** (**`55.3%`**) | — |
+| `test` 383 long stitched pass (`fixed/regressed`) | `87.47%` | `88.25%` (`+5/-2`) | `88.51%` (`+7/-3`) | — | **`88.77%`** (**`+8/-3`**) | — |
+| `test` 383 long `exec_root_err` (`paired t`) | `0.2711 m` | `0.2629 m` (`t=-1.05`) | `0.2616 m` (`t=-1.84`) | — | **`0.2513 m`** (**`t=-2.29`**) | — |
+| `test` 383 long `exec_jmae` (`paired t`) | `0.1068 rad` | `0.1051 rad` (`t=-3.22`) | `0.1061 rad` (`t=-2.04`) | — | **`0.1047 rad`** (**`t=-5.68`**) | — |
+| `test` 383 long `seam_jump` (`paired t`) | `0.0839 rad` | `0.0829 rad` (`t=-12.86`) | **`0.0807 rad`** (`t=-18.33`) | — | `0.0814 rad` (`t=-13.60`) | — |
+| Real 300f dance video `exec_root_err` (`jmae`) | `0.2057 m` (`0.1699`) | `0.1977 m` (`0.1681`) | **`0.1747 m`** (`0.1717`) | — | `0.1967 m` (**`0.1671`**) | `0.1831 m` (`0.1682`) |
+
 ### Remaining open research questions
 
-- Uniform in-domain 120-frame sampling saturates near 98.6% Base success and
-  gave `fidelity` 3.3x more weight than `exec_track`, yielding only a `0.109%`
-  weight shift in 500 steps. Next-round PPO requires hard-clip / OOD /
-  longer-horizon mining, higher execution-tracking weight, and larger effective
-  update budgets verified against held-out hard benchmarks and real videos.
+- PPO v2 (`step 900–1200`) achieved statistically significant reductions on
+  383 long-horizon sequences (`exec_root_err -19.7 mm, t=-2.29`; `exec_jmae
+  t=-5.68`; `seam_jump t=-13.60`), improved untouched `test` Bucket A pass rate
+  from `3/22` to `6–7/22`, and fixed `2/3` fixable failures on the 640-clip
+  test set with zero regressions, while preserving pose fidelity (`0.5100` vs
+  `0.5100`).
+- Two remaining bottlenecks are directly evidenced by these measurements:
+  1. Late-stage overfitting after ~900–1200 steps on the small `407`-clip
+     Bucket A pool (`7/22 -> 4/22` from step 900 to 1500) plus a mild `-1.25%`
+     mean joint velocity smoothing on 640 short clips (`t=-11.00`).
+  2. Multi-window stitch-seam discontinuity (`0.0814` vs `0.0137 rad`, ~6x)
+     still causes `11/43` long-horizon failures because PPO currently rolls out
+     single 120-frame windows rather than stitched multi-window sequences.
