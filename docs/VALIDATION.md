@@ -285,18 +285,36 @@ Protocol v4 SONIC/MuJoCo tracker):
 | `test` 383 long `seam_jump` (`paired t`) | `0.0839 rad` | `0.0829 rad` (`t=-12.86`) | **`0.0807 rad`** (`t=-18.33`) | — | `0.0814 rad` (`t=-13.60`) | — |
 | Real 300f dance video `exec_root_err` (`jmae`) | `0.2057 m` (`0.1699`) | `0.1977 m` (`0.1681`) | **`0.1747 m`** (`0.1717`) | — | `0.1967 m` (**`0.1671`**) | `0.1831 m` (`0.1682`) |
 
+### PPO v3 (`ddpo_stitched_v3` / `reward_v3`, 800 steps) & multi-frame overlap stitching ablation (`n = 392`)
+
+1. **Stitched PPO v3 diagnosis (`post_training/train_ppo_stitched.py`, 800 steps, 8-GPU DDP)**:
+   Warm-started from `v2_900` with KL anchored to frozen `vith_offline_g1.ckpt` (`kl_coef=0.015`, `lr=2e-5 -> 4e-6`, `7,155` clean `>=239f` train pairs weighted `2.5x` on hard keys). On 64 held-out `val` stitched pairs (`DDIM-50 eta=0.0`), survival increased slightly (`89.06% -> 90.63%`, `0.9459 -> 0.9610`), while `val/seam_joint_jump_rad` stayed nearly unchanged (`0.0801 -> 0.0803 rad`) and weight L2 shift plateaued at `0.251%` after step 400. Directly measuring `val/seam_overlap_err_rad = 0.0775 rad` established that **97%** of the 1-frame seam discontinuity comes from boundary-context asymmetry between independently denoised 120-frame windows rather than policy weights.
+
+2. **Multi-frame overlap cosine/SLERP+FK & gravity-preserving `yaw` alignment ablation (`post_training/stitching.py`, `post_training/eval_long_horizon.py`)**:
+   Evaluated in parallel across all **`n = 392` untouched `test` sequences (`>= 240` frames: `bedlam2 + h36m + bedlam`, `DDIM-50 eta=0.0`, frozen Protocol v4 tracker)**:
+
+| Stitching config | Model | Pass% | Fails | `Pass\|GT` | Survival | `exec_root_err` | `exec_jmae` | `SeamPeak` | `OvMean` | `RefMPJPE` | Chunks | Paired vs `Base (ov1_so3)` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| **GT ceiling** | `GT` | `93.37%` | `26` | `100.00%` | `0.9612` | `0.2855 m` | `0.1323` | — | — | — | — | — |
+| `ov1_so3` (legacy) | `Base` | `87.76%` | `48` | `89.89%` | `0.9523` | `0.2685 m` | `0.1089` | `0.0837` | `0.0837` | `0.2785` | `3.90` | Baseline |
+| `ov1_so3` (legacy) | `PPO v3_800` | `87.76%` | `48` | `89.89%` | `0.9552` | `0.2608 m` | `0.1072` | `0.0812` | `0.0812` | `0.2785` | `3.90` | `+5/-5` (`p=1.0`), `-7.7 mm` |
+| `ov16_so3_cosine` | `Base` | `90.05%` | `39` | `92.08%` | `0.9636` | `0.2168 m` | `0.1063` | `0.0236` | `0.0155` | `0.2782` | `4.59` | `+18/-9` (`p=0.122`), `-51.7 mm` |
+| `ov16_yaw_cosine` | `Base` | `92.09%` | `31` | `93.72%` | `0.9724` | `0.1907 m` | `0.1056` | `0.0236` | `0.0155` | **`0.2778`** | `4.59` | **`+21/-4` (`p=9.1e-4`)**, `-77.8 mm` |
+| **`ov16_yaw_cosine`** | **`PPO v2_1200`** | **`93.37%`** | **`26`** | **`95.08%`** | `0.9756` | **`0.1862 m`** | **`0.1035`** | **`0.0234`** | `0.0153` | `0.2783` | `4.59` | **`+25/-3` (`p=2.7e-5`)**, **`-82.3 mm (t=-3.52)`** |
+| `ov24_yaw_cosine` | `Base` | `92.60%` | `29` | `94.26%` | `0.9746` | `0.1889 m` | `0.1058` | `0.0246` | `0.0149` | **`0.2778`** | `4.70` | `+24/-5` (`p=5.5e-4`), `-79.6 mm` |
+| **`ov24_yaw_cosine`** | **`PPO v2_1200`** | **`93.37%`** | **`26`** | **`95.08%`** | **`0.9773`** | `0.1874 m` | `0.1036` | `0.0242` | **`0.0147`** | `0.2783` | `4.70` | **`+25/-3` (`p=2.7e-5`)**, `-81.1 mm (t=-3.40)` |
+
+Key findings from the 3-factor additive decomposition:
+- **Multi-frame cosine + SLERP + `fk_g1` overlap (`ov1 -> ov16`, `so3`, `Base`)**: cuts `SeamPeak` `-71.8%` (`0.0837 -> 0.0236 rad`, `t=-38.77`, `99.7%` improved) and `exec_root_err` `-51.7 mm` (`t=-2.85`) with zero fidelity loss (`RefMPJPE 0.2785 -> 0.2782 m`).
+- **Gravity-preserving `yaw`-only alignment (`so3 -> yaw` at `ov16`, `Base`)**: adds `+13/-5` passes and cuts `exec_root_err` another `-26.1 mm` (`t=-2.92`), eliminating pitch/roll floor-plane tilt accumulation across windows (on `600+f` sequences `exec_root_err` drops from `1.365 m -> 0.746 m`).
+- **PPO `v2_1200` stacks additively on top of `ov16_yaw_cosine`**: adds `+6/-1` passes (`92.09% -> 93.37%`, matching the GT ceiling overall and on `600+f` at `64.71%` with `0` near-seam failures) and further improves `exec_jmae` (`0.1056 -> 0.1035 rad`, `t=-6.37`, `72.7%` better).
+
+3. **Real 300-frame dancing video (`tools/infer_video.py`, `seed=42`, `3 chunks` for both `ov1` and `ov16`)**:
+   All runs passed Protocol v4 (`is_success=True`). Switching from legacy `ov1_so3` to default `ov16_yaw_cosine` cut `SeamPeak` `-34.7%` (`0.1040 -> 0.0679 rad` on Base; `0.0664 rad` on `v2_1200`), cut `OvMean` `-51.3%` (`0.1040 -> 0.0507 rad`; `0.0489 rad` on `v2_1200`), and achieved the lowest `exec_jmae` (`0.1630 rad` on `v2_1200 + ov16_yaw` vs `0.1699 rad` on `Base + ov1_so3`). On this single clip, shifted chunk boundaries increased horizontal `xy` displacement (`0.141 -> 0.201 m` on Base) while preserving vertical stability (`z_span = 0.179–0.182 m`); under identical `ov16_yaw` boundaries, PPO `v2_900` (`0.2111 m`, `-41.3 mm`) and `v2_1200` (`0.2235 m`, `-28.9 mm`) both reduced root error vs `Base` (`0.2524 m`).
+
 ### Remaining open research questions
 
-- PPO v2 (`step 900–1200`) achieved statistically significant reductions on
-  383 long-horizon sequences (`exec_root_err -19.7 mm, t=-2.29`; `exec_jmae
-  t=-5.68`; `seam_jump t=-13.60`), improved untouched `test` Bucket A pass rate
-  from `3/22` to `6–7/22`, and fixed `2/3` fixable failures on the 640-clip
-  test set with zero regressions, while preserving pose fidelity (`0.5100` vs
-  `0.5100`).
-- Two remaining bottlenecks are directly evidenced by these measurements:
-  1. Late-stage overfitting after ~900–1200 steps on the small `407`-clip
-     Bucket A pool (`7/22 -> 4/22` from step 900 to 1500) plus a mild `-1.25%`
-     mean joint velocity smoothing on 640 short clips (`t=-11.00`).
-  2. Multi-window stitch-seam discontinuity (`0.0814` vs `0.0137 rad`, ~6x)
-     still causes `11/43` long-horizon failures because PPO currently rolls out
-     single 120-frame windows rather than stitched multi-window sequences.
+- The combination of **PPO v2 (`v2_900`–`v2_1200`) + `ov16_yaw_cosine` inference stitching** now matches the untouched `test` long-horizon GT pass-rate ceiling (`93.37%`, `Pass|GT = 95.08%`, `exec_root_err = 0.1862 m`) while improving short-window `Bucket A` pass rate (`3/22 -> 6–7/22`) and `640`-clip pass rate (`98.59% -> 98.91%`, `+2/-0`).
+- Remaining headroom is concentrated in:
+  1. Expanding dynamic hard-clip coverage beyond the `407`-clip `Bucket A` pool (to prevent late-step overfitting past ~900–1200 PPO steps);
+  2. Prefix-conditioned / inpainting window continuation if tighter cross-window pose coupling is needed on ultra-long (`600+f`) out-of-domain videos.

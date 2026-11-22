@@ -47,11 +47,14 @@ conversion, normalization statistics, and frame rate. See
 [export conversion](../tools/infer_video.py#L322) and
 [tracker input schema](../g1_tracker/README.md#input).
 
-Long-video inference currently overlaps adjacent windows by one frame and
-rigidly aligns each later window to the preceding endpoint. This is part of
-the baseline, not an implicit autoregressive PPO design. See
-[window construction](../tools/infer_video.py#L177) and
-[window alignment](../tools/infer_video.py#L189).
+Long-video inference supports configurable multi-frame overlap stitching via
+[stitching.py](../post_training/stitching.py) and
+[infer_video.py](../tools/infer_video.py). By default, `tools/infer_video.py`
+uses `--overlap 16 --align-mode yaw --blend-mode cosine` (gravity-preserving
+Y-axis alignment, raised-cosine joint/root blending, geodesic quaternion SLERP,
+and exact `fk_g1` body-link recomputation); passing
+`--overlap 1 --align-mode so3` reproduces the legacy 1-frame rigid endpoint
+alignment (`align_window_to_previous`) bit-for-bit.
 
 ## Checkpoint and feature compatibility
 
