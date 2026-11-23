@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from typing import Callable
+from typing import Any, Callable
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -12,6 +13,260 @@ from motion_lib.motion_utils.rotation_conversions import (
     matrix_to_quaternion,
     quaternion_to_matrix,
 )
+from post_training.policy import build_ddim_schedule
+
+G1_LOCAL_VEL_START = 186  # [0:174] body_pose_r6d, [174:180] cam orient, [180:186] gv orient, [186:189] local_transl_vel
+
+
+@torch.no_grad()
+def sample_ddim_synchronized(
+    pipeline: Any,
+    denoiser: torch.nn.Module,
+    f_cond: torch.Tensor,
+    length: torch.Tensor,
+    x_init: torch.Tensor,
+    chunks_meta: list[tuple[int, int]],
+    total_len: int,
+    ddim_steps: int = 50,
+    eta: float = 0.0,
+    all_valid_length: bool = False,
+    use_bf16: bool = True,
+    sync_mode: str = "none",
+    sync_weight_mode: str = "cosine",
+    inpaint_resamples: int = 1,
+    resample_seed: int = 2026,
+) -> torch.Tensor:
+    """DDIM sampling across overlapping chunks with optional overlap-region synchronization.
+
+    Empirically verified 189-D invariance across independently canonicalized windows:
+      - [0:174]   body_pose_r6d:    window-invariant (0.00e+00)
+      - [174:180] global_orient_c:  window-invariant (per-frame camera frame, ~1e-6)
+      - [180:186] global_orient_gv: window-invariant (per-frame GV_t frame, ~3e-6)
+      - [186:189] local_transl_vel: window-invariant on frames 0..ov-2 (body frame, ~3e-5);
+        frame ov-1 (last valid frame of earlier chunk) is last-frame padded during encoding,
+        so synchronization leaves [186:189] on frame ov-1 controlled by the later chunk.
+
+    Args:
+        sync_mode:
+            - `"none"`: independent batched DDIM across chunks (baseline).
+            - `"multidiffusion"`: batched bidirectional joint denoising — shares initial
+              noise on overlapping valid frames and fuses `pred_x0` across overlapping
+              windows at every DDIM step with cosine (or uniform) interior weights.
+            - `"inpainting"`: sequential causal DDIM prefix inpainting (chunk 0 -> N-1)
+              constraining each chunk's overlap prefix to the previous chunk's clean `x0`
+              (with optional RePaint-style resampling via `inpaint_resamples > 1`).
+    """
+    if sync_mode not in ("none", "multidiffusion", "inpainting"):
+        raise ValueError(f"Unsupported sync_mode {sync_mode!r}; expected 'none', 'multidiffusion', or 'inpainting'")
+    if sync_weight_mode not in ("cosine", "uniform"):
+        raise ValueError(f"Unsupported sync_weight_mode {sync_weight_mode!r}")
+    if inpaint_resamples < 1:
+        raise ValueError(f"inpaint_resamples must be >= 1, got {inpaint_resamples}")
+
+    device = f_cond.device
+    n_chunks, window, x_dim = x_init.shape
+    schedule = build_ddim_schedule(int(pipeline.train_diffusion.num_timesteps), int(ddim_steps))
+    alphas_full = np.asarray(pipeline.train_diffusion.alphas_cumprod, dtype=np.float64)
+    ab = np.array([alphas_full[t] for t in schedule], dtype=np.float64)
+    ab_prev = np.append(1.0, ab[:-1])
+
+    sigmas = (
+        float(eta)
+        * np.sqrt(np.maximum((1.0 - ab_prev) / (1.0 - ab), 0.0))
+        * np.sqrt(np.maximum(1.0 - ab / ab_prev, 0.0))
+    )
+    sigmas[0] = 0.0
+    sqrt_ab = np.sqrt(ab)
+    sqrt_1m_ab = np.sqrt(1.0 - ab)
+    sqrt_ab_prev = np.sqrt(ab_prev)
+    dir_coeff = np.sqrt(np.maximum(1.0 - ab_prev - sigmas**2, 0.0))
+    ts_orig = torch.tensor(schedule, dtype=torch.long, device=device)
+
+    denoiser.eval()
+
+    if sync_mode == "none" or n_chunks == 1:
+        x = x_init.clone().float()
+        for step_idx in reversed(range(ddim_steps)):
+            ts = ts_orig[step_idx].expand(n_chunks)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16 and device.type == "cuda"):
+                out = denoiser(
+                    f_cond=f_cond,
+                    length=length,
+                    xt=x,
+                    timesteps=ts,
+                    all_valid_length=all_valid_length,
+                )
+            pred_x0 = out["pred_x_start"].float()
+            eps = (x - float(sqrt_ab[step_idx]) * pred_x0) / max(float(sqrt_1m_ab[step_idx]), 1e-8)
+            mean = float(sqrt_ab_prev[step_idx]) * pred_x0 + float(dir_coeff[step_idx]) * eps
+            sigma_k = float(sigmas[step_idx])
+            x = mean + sigma_k * torch.randn_like(x) if (step_idx > 0 and sigma_k > 0.0) else mean
+        return x
+
+    if sync_mode == "multidiffusion":
+        # 1. Share i.i.d. N(0, I) initial noise across overlapping valid frames.
+        x_canvas_init = torch.zeros(total_len, x_dim, device=device, dtype=torch.float32)
+        prev_end = 0
+        for ci, (start, actual_len) in enumerate(chunks_meta):
+            end = start + actual_len
+            if ci == 0:
+                x_canvas_init[start:end] = x_init[ci, :actual_len].float()
+            else:
+                ov = prev_end - start
+                x_canvas_init[prev_end:end] = x_init[ci, ov:actual_len].float()
+            prev_end = end
+
+        x = x_init.clone().float()
+        for ci, (start, actual_len) in enumerate(chunks_meta):
+            x[ci, :actual_len] = x_canvas_init[start : start + actual_len]
+
+        # 2. Precompute per-chunk fusion weights (separate for [0:186] and [186:189]).
+        w_pose = torch.zeros(n_chunks, window, device=device, dtype=torch.float32)
+        w_vel = torch.zeros(n_chunks, window, device=device, dtype=torch.float32)
+        for ci, (start, actual_len) in enumerate(chunks_meta):
+            w_pose[ci, :actual_len] = 1.0
+            w_vel[ci, :actual_len] = 1.0
+
+        prev_end = chunks_meta[0][0] + chunks_meta[0][1]
+        for ci in range(1, n_chunks):
+            start, actual_len = chunks_meta[ci]
+            prev_start, prev_len = chunks_meta[ci - 1]
+            ov = prev_end - start
+            if ov > 0:
+                if sync_weight_mode == "cosine":
+                    idx = torch.arange(1, ov + 1, device=device, dtype=torch.float32)
+                    alpha = 0.5 * (1.0 - torch.cos(math.pi * idx / float(ov + 1)))
+                else:
+                    alpha = torch.full((ov,), 0.5, device=device, dtype=torch.float32)
+                w_pose[ci - 1, prev_len - ov : prev_len] = 1.0 - alpha
+                w_pose[ci, :ov] = alpha
+                w_vel[ci - 1, prev_len - ov : prev_len] = 1.0 - alpha
+                w_vel[ci, :ov] = alpha
+                # Exclude earlier chunk's last padded velocity frame (prev_len - 1).
+                w_vel[ci - 1, prev_len - 1] = 0.0
+                w_vel[ci, ov - 1] = 1.0
+            prev_end = start + actual_len
+
+        denom_pose = torch.zeros(total_len, 1, device=device, dtype=torch.float32)
+        denom_vel = torch.zeros(total_len, 1, device=device, dtype=torch.float32)
+        for ci, (start, actual_len) in enumerate(chunks_meta):
+            denom_pose[start : start + actual_len, 0] += w_pose[ci, :actual_len]
+            denom_vel[start : start + actual_len, 0] += w_vel[ci, :actual_len]
+        denom_pose = denom_pose.clamp(min=1e-8)
+        denom_vel = denom_vel.clamp(min=1e-8)
+
+        # 3. Synchronized batched DDIM denoising loop.
+        vel_s = min(G1_LOCAL_VEL_START, x_dim)
+        for step_idx in reversed(range(ddim_steps)):
+            ts = ts_orig[step_idx].expand(n_chunks)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16 and device.type == "cuda"):
+                out = denoiser(
+                    f_cond=f_cond,
+                    length=length,
+                    xt=x,
+                    timesteps=ts,
+                    all_valid_length=all_valid_length,
+                )
+            pred_x0 = out["pred_x_start"].float()
+
+            canvas_pose = torch.zeros(total_len, vel_s, device=device, dtype=torch.float32)
+            canvas_vel = torch.zeros(total_len, x_dim - vel_s, device=device, dtype=torch.float32)
+            for ci, (start, actual_len) in enumerate(chunks_meta):
+                end = start + actual_len
+                canvas_pose[start:end] += w_pose[ci, :actual_len, None] * pred_x0[ci, :actual_len, :vel_s]
+                if x_dim > vel_s:
+                    canvas_vel[start:end] += w_vel[ci, :actual_len, None] * pred_x0[ci, :actual_len, vel_s:]
+            canvas_pose = canvas_pose / denom_pose
+            if x_dim > vel_s:
+                canvas_vel = canvas_vel / denom_vel
+
+            for ci, (start, actual_len) in enumerate(chunks_meta):
+                end = start + actual_len
+                pred_x0[ci, :actual_len, :vel_s] = canvas_pose[start:end]
+                if x_dim > vel_s:
+                    pred_x0[ci, :actual_len, vel_s:] = canvas_vel[start:end]
+
+            eps = (x - float(sqrt_ab[step_idx]) * pred_x0) / max(float(sqrt_1m_ab[step_idx]), 1e-8)
+            mean = float(sqrt_ab_prev[step_idx]) * pred_x0 + float(dir_coeff[step_idx]) * eps
+            sigma_k = float(sigmas[step_idx])
+            if step_idx > 0 and sigma_k > 0.0:
+                noise_canvas = torch.randn(total_len, x_dim, device=device, dtype=torch.float32)
+                noise = torch.randn_like(x)
+                for ci, (start, actual_len) in enumerate(chunks_meta):
+                    noise[ci, :actual_len] = noise_canvas[start : start + actual_len]
+                x = mean + sigma_k * noise
+            else:
+                x = mean
+        return x
+
+    # sync_mode == "inpainting": sequential causal DDIM prefix inpainting (chunk 0 -> N-1)
+    vel_s = min(G1_LOCAL_VEL_START, x_dim)
+    x0_out = torch.zeros_like(x_init, dtype=torch.float32)
+    res_gen = torch.Generator(device=device).manual_seed(int(resample_seed))
+    prev_end = 0
+
+    for ci, (start, actual_len) in enumerate(chunks_meta):
+        f_c = f_cond[ci : ci + 1]
+        l_c = length[ci : ci + 1]
+        all_valid_c = bool(actual_len == window)
+        x_c = x_init[ci : ci + 1].clone().float()
+
+        if ci == 0:
+            for step_idx in reversed(range(ddim_steps)):
+                ts = ts_orig[step_idx].expand(1)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16 and device.type == "cuda"):
+                    out = denoiser(f_cond=f_c, length=l_c, xt=x_c, timesteps=ts, all_valid_length=all_valid_c)
+                pred_x0 = out["pred_x_start"].float()
+                eps = (x_c - float(sqrt_ab[step_idx]) * pred_x0) / max(float(sqrt_1m_ab[step_idx]), 1e-8)
+                mean = float(sqrt_ab_prev[step_idx]) * pred_x0 + float(dir_coeff[step_idx]) * eps
+                sigma_k = float(sigmas[step_idx])
+                x_c = mean + sigma_k * torch.randn_like(x_c) if (step_idx > 0 and sigma_k > 0.0) else mean
+            x0_out[ci] = x_c[0]
+            prev_end = start + actual_len
+            continue
+
+        prev_len = chunks_meta[ci - 1][1]
+        ov = prev_end - start
+        x0_known_full = torch.zeros(1, window, x_dim, device=device, dtype=torch.float32)
+        x0_known_full[0, :ov] = x0_out[ci - 1, prev_len - ov : prev_len]
+
+        mask = torch.zeros(1, window, x_dim, device=device, dtype=torch.float32)
+        if ov > 1:
+            mask[0, : ov - 1, :] = 1.0
+        mask[0, ov - 1, :vel_s] = 1.0  # Leave local_transl_vel free at prev's padded end frame.
+
+        eps_known = x_init[ci : ci + 1].clone().float()
+
+        for step_idx in reversed(range(ddim_steps)):
+            ts = ts_orig[step_idx].expand(1)
+            n_res = inpaint_resamples if step_idx > 0 else 1
+            for r_idx in range(n_res):
+                x_known_t = float(sqrt_ab[step_idx]) * x0_known_full + float(sqrt_1m_ab[step_idx]) * eps_known
+                x_in = mask * x_known_t + (1.0 - mask) * x_c
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16 and device.type == "cuda"):
+                    out = denoiser(f_cond=f_c, length=l_c, xt=x_in, timesteps=ts, all_valid_length=all_valid_c)
+                pred_x0 = out["pred_x_start"].float()
+                pred_x0_sync = mask * x0_known_full + (1.0 - mask) * pred_x0
+
+                eps = (x_in - float(sqrt_ab[step_idx]) * pred_x0_sync) / max(float(sqrt_1m_ab[step_idx]), 1e-8)
+                mean = float(sqrt_ab_prev[step_idx]) * pred_x0_sync + float(dir_coeff[step_idx]) * eps
+                sigma_k = float(sigmas[step_idx])
+                x_prev = mean + sigma_k * torch.randn_like(x_c) if (step_idx > 0 and sigma_k > 0.0) else mean
+
+                if step_idx > 0 and r_idx < n_res - 1:
+                    ratio_ab = float(ab[step_idx] / max(ab_prev[step_idx], 1e-12))
+                    z = torch.randn(x_c.shape, device=device, dtype=torch.float32, generator=res_gen)
+                    x_c = math.sqrt(ratio_ab) * x_prev + math.sqrt(max(1.0 - ratio_ab, 0.0)) * z
+                    # Keep eps_known Markov-consistent with the exact jump-back sample q(x_t | x_{t-1}).
+                    eps_known = (x_c - float(sqrt_ab[step_idx]) * x0_known_full) / max(float(sqrt_1m_ab[step_idx]), 1e-8)
+                else:
+                    x_c = x_prev
+
+        x0_out[ci] = (mask * x0_known_full + (1.0 - mask) * x_c)[0]
+        prev_end = start + actual_len
+
+    return x0_out
 
 
 def chunk_windows(total_len: int, window: int = 120, overlap: int = 1) -> list[tuple[int, int]]:

@@ -19,6 +19,7 @@ from post_training.reward import (
 )
 from post_training.stitching import (
     chunk_windows,
+    sample_ddim_synchronized,
     slerp_quaternions,
     stitch_sequence_yup,
     stitch_two_chunks_yup,
@@ -474,6 +475,45 @@ class TestPPOComponents(unittest.TestCase):
         R_after = quaternion_to_matrix(out_yaw["root_quat_w"][120:])
         up_vec = R_after[:, :, 1]  # transformed +Y axis
         self.assertLess(float((up_vec - torch.tensor([0.0, 1.0, 0.0])).abs().max().item()), 1e-5)
+
+    def test_synchronized_ddim_multidiffusion_and_inpainting(self) -> None:
+        torch.manual_seed(31)
+        pipe = _make_fake_pipeline(100)
+        denoiser = _TinyDenoiser(x_dim=189, cond_dim=16).eval()
+
+        # 3 overlapping chunks of window=16, overlap=4 covering total_len=40
+        chunks = chunk_windows(40, window=16, overlap=4)
+        self.assertEqual(chunks, [(0, 16), (12, 16), (24, 16)])
+        f_cond = torch.randn(3, 16, 16)
+        length = torch.tensor([16, 16, 16], dtype=torch.long)
+        x_init = torch.randn(3, 16, 189)
+
+        # 1. MultiDiffusion synchronizes [0:186] across all 4 overlap frames and [186:189] across frames 0..2
+        x0_md = sample_ddim_synchronized(
+            pipe, denoiser, f_cond, length, x_init, chunks, total_len=40,
+            ddim_steps=6, eta=0.0, all_valid_length=True, use_bf16=False,
+            sync_mode="multidiffusion", sync_weight_mode="cosine",
+        )
+        self.assertTrue(bool(torch.isfinite(x0_md).all().item()))
+        for ci in (1, 2):
+            pose_err = float((x0_md[ci, :4, :186] - x0_md[ci - 1, 12:16, :186]).abs().max().item())
+            vel_err = float((x0_md[ci, :3, 186:] - x0_md[ci - 1, 12:15, 186:]).abs().max().item())
+            self.assertLess(pose_err, 1e-5)
+            self.assertLess(vel_err, 1e-5)
+
+        # 2. Causal Inpainting (resamples=1 and resamples=2) locks [0:3, :189] and [3, :186] cleanly
+        for n_res in (1, 2):
+            x0_inp = sample_ddim_synchronized(
+                pipe, denoiser, f_cond, length, x_init, chunks, total_len=40,
+                ddim_steps=6, eta=0.0, all_valid_length=True, use_bf16=False,
+                sync_mode="inpainting", inpaint_resamples=n_res, resample_seed=99,
+            )
+            self.assertTrue(bool(torch.isfinite(x0_inp).all().item()))
+            for ci in (1, 2):
+                pose_err = float((x0_inp[ci, :4, :186] - x0_inp[ci - 1, 12:16, :186]).abs().max().item())
+                vel_err = float((x0_inp[ci, :3, 186:] - x0_inp[ci - 1, 12:15, 186:]).abs().max().item())
+                self.assertLess(pose_err, 1e-5)
+                self.assertLess(vel_err, 1e-5)
 
 
 if __name__ == "__main__":
