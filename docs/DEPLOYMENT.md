@@ -1,10 +1,9 @@
 # Deployment
 
-Run commands from the repository root. This checkout contains the released
-offline base model and a fixed G1 tracker. It does not yet contain a PPO
-post-training implementation. See [VALIDATION.md](VALIDATION.md) for checks
-actually performed; installation instructions are not evidence of an
-end-to-end video run.
+Run commands from the repository root. This repository includes the released
+offline base model, the Diffusion-PPO post-training and MultiDiffusion stitching
+pipeline (`post_training/`), and the fixed G1 tracker (`g1_tracker/`). See
+[VALIDATION.md](VALIDATION.md) for benchmark results and remaining limits.
 
 ## Supported base-model platform
 
@@ -52,6 +51,23 @@ The `optional` profile is for optional assets such as DPVO and HMR2; `all`
 includes every manifest asset. Downloading a profile does not install the
 corresponding software or the external assets below. The released base uses
 SAM3D image features; HMR2 is not a substitute for a missing SAM3D setup.
+
+## PPO post-trained checkpoints
+
+Post-trained Diffusion-PPO inference checkpoints (`float32`, weights-only,
+`imgfeat_encoder="sam3d"`) are hosted on ModelScope at
+[Jasonhsc/vit-h-ppo](https://www.modelscope.cn/models/Jasonhsc/vit-h-ppo)
+under `checkpoints/` with full SHA-256 digests in `manifest.json`:
+
+```bash
+pip install modelscope
+modelscope download --model Jasonhsc/vit-h-ppo \
+  checkpoints/hard_ppo_decomposed_step1200.pt \
+  --local_dir ./inputs/checkpoints/vith_ppo
+```
+
+See the root [README.md](../README.md) for the full checkpoint table and
+recommended inference flags.
 
 ## External assets and the SAM3D integration prerequisite
 

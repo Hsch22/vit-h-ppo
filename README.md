@@ -1,37 +1,86 @@
-# ViT-H PPO team repository
+# ViT-H PPO Post-Training & Long-Horizon Stitching
 
-This repository starts from the released ViT-H offline video-to-G1 model.
-Our project objective is PPO post-training of the **motion generator**, using
-the existing fixed SONIC/MuJoCo tracker for execution feedback. The original
-implementation and attribution are preserved below.
+This repository builds on the released ViT-H offline video-to-G1 motion generator (`base/vith-release-2482c5c`) with **Diffusion-PPO post-training** (using frozen SONIC ONNX + MuJoCo execution feedback) and **long-horizon synchronized stitching** (16-frame overlap, gravity-preserving yaw cosine alignment, and MultiDiffusion joint denoising). The original upstream implementation and attribution are preserved below.
 
-**Current status:** base training, video inference and tracker code are
-included. A PPO trainer is **not implemented** in this snapshot. The default
-DDIM sampler is deterministic conditional on its initial noise; defining a
-valid stochastic policy and its log-probabilities is part of the next stage.
+## Current Status & Key Results
 
-Start here:
+- **Post-training (`post_training/`):** Implemented 8-GPU DDP Diffusion-PPO (`ddpo_single_window` / `ddpo_stitched_window`) with `combined_track`, `decomposed_vel`, and `stitched_seam` rewards plus hard-example mining (`train / val / test` split by video source).
+- **Default inference (`tools/infer_video.py`):** Defaults to `--overlap 16 --align-mode yaw --blend-mode cosine --sync-mode multidiffusion` (`+0.9%` runtime overhead vs. un-synchronized overlap, zero extra forward passes per step).
+- **Validated gains (`Hard-PPO step 1200 + MultiDiffusion`, deterministic `DDIM-50, eta=0.0`):**
+  - `test` long sequences (`n = 392`, `>=240f`): **94.13%** pass rate (`+28/-3`, McNemar `p = 4.65e-6` vs. legacy `Base ov1_so3` 87.76%; exceeds GT ceiling 93.37%), `RootErr` `0.2685 -> 0.1868 m` (`-81.7 mm`), `OvMean = 0.0148 rad`.
+  - `val` 3-seed confirmation (`n = 401 × 3 = 1,203` trials): **90.27%** (`95% CI [87.28%, 93.02%]`, `std 0.25%`), zero degradation vs. `ov16_none` (`89.94%`).
+  - Real-world multi-window dance videos (`8 videos × 3 seeds = 24` trials): **24/24 (100%)** pass rate (`Base ov1_so3`: 23/24, `RootErr` `0.2844 -> 0.2475 m`).
+
+## PPO Post-Trained Checkpoints (ModelScope)
+
+Large model weights (`~899 MB` each, `~3.6 GB` total) exceed GitHub's 100 MB Git limit and free Git LFS quota, and GitHub Releases flattens directory paths. All post-trained checkpoints are synced with clean, readable paths on ModelScope:
+
+- **ModelScope repository:** [https://www.modelscope.cn/models/Jasonhsc/vit-h-ppo](https://www.modelscope.cn/models/Jasonhsc/vit-h-ppo)
+- **Format:** Weights-only `float32` inference checkpoints (`model_state_dict`, `imgfeat_encoder="sam3d"`, sanitized metadata; optimizer state stripped, bit-for-bit identical inference weights). Full SHA-256 digests are in `manifest.json` in the ModelScope repo.
+
+```text
+Jasonhsc/vit-h-ppo/
+├── README.md
+├── manifest.json
+└── checkpoints/
+    ├── hard_ppo_decomposed_step1200.pt   # Recommended default (long-horizon + MultiDiffusion)
+    ├── hard_ppo_decomposed_step0900.pt   # Best short-window / hard-case (Bucket A)
+    ├── pilot_uniform_step0500.pt         # Ablation: uniform-sampling PPO (500 steps)
+    └── stitched_seam_step0800.pt         # Ablation: dual-window stitched-seam PPO (+800 steps)
+```
+
+| Checkpoint Path | Method | Step | Size | SHA-256 (prefix) | Recommended For |
+| --- | --- | ---: | ---: | --- | --- |
+| **`checkpoints/hard_ppo_decomposed_step1200.pt`** | Hard-PPO (`decomposed_vel`) | 1200 | 898.86 MB | `c49cd815796bafd4` | **Default** — best long-horizon & MultiDiffusion (`94.13%` test, `90.27%` val 3-seed) |
+| `checkpoints/hard_ppo_decomposed_step0900.pt` | Hard-PPO (`decomposed_vel`) | 900 | 898.86 MB | `a0c5e44cfa16d177` | Short-window / high-dynamic hard cases (`Bucket A 7/22`, `Bucket B 0.1591 m`) |
+| `checkpoints/pilot_uniform_step0500.pt` | Pilot Uniform PPO (`combined_track`) | 500 | 898.86 MB | `3f27f94248e26157` | Uniform-sampling ablation |
+| `checkpoints/stitched_seam_step0800.pt` | Stitched-Seam PPO (`stitched_seam`) | 800 | 898.86 MB | `e5f48331c8e5c6f7` | Dual-window seam-reward ablation |
+
+Download the recommended checkpoint (or all checkpoints) into the gitignored `inputs/checkpoints/vith_ppo/` directory:
+
+```bash
+pip install modelscope
+
+# Download only the recommended checkpoint
+modelscope download --model Jasonhsc/vit-h-ppo \
+  checkpoints/hard_ppo_decomposed_step1200.pt \
+  --local_dir ./inputs/checkpoints/vith_ppo
+
+# Or download the full checkpoint repo via Python SDK
+python -c "from modelscope import snapshot_download; print(snapshot_download('Jasonhsc/vit-h-ppo', local_dir='./inputs/checkpoints/vith_ppo'))"
+```
+
+Run long-horizon inference with the downloaded PPO checkpoint (MultiDiffusion 16-frame yaw stitching and `sam3d` encoder auto-detection are enabled by default; add `--static-cam` for fixed-tripod videos):
+
+```bash
+python tools/infer_video.py \
+  --video /path/to/input.mp4 \
+  --ckpt inputs/checkpoints/vith_ppo/checkpoints/hard_ppo_decomposed_step1200.pt \
+  --sam3d-root third-party/Fast-SAM-3D-Body \
+  --sam3d-ckpt-path third-party/Fast-SAM-3D-Body/checkpoints/sam-3d-body-dinov3/model.ckpt \
+  --sam3d-mhr-path third-party/Fast-SAM-3D-Body/checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt \
+  --output outputs/inference/input_g1.npz
+```
+
+## Documentation & Workspace Guide
 
 - [Deployment and external assets](docs/DEPLOYMENT.md)
-- [Pinned checkpoint download and verification](config/checkpoints.json):
+- [Pinned base/tracker checkpoint download and verification](config/checkpoints.json):
   `python scripts/checkpoints.py list`
-- [Architecture and PPO integration decisions](docs/PPO_INTEGRATION.md)
+- [Architecture, PPO training, and MultiDiffusion stitching design](docs/PPO_INTEGRATION.md)
 - [Four-person workflow and handoffs](docs/TEAM_WORKFLOW.md)
-- [Checks actually performed and remaining limits](docs/VALIDATION.md)
+- [Validation benchmarks, ablations, and remaining limits](docs/VALIDATION.md)
 - [Source import provenance](docs/SOURCE_IMPORT.md)
 
-The unchanged import is tagged `base/vith-release-2482c5c`. Keep checkpoints,
-datasets, secrets and generated rollouts outside Git. Use small personal
-branches and pull requests for shared changes.
+The unchanged upstream import is tagged `base/vith-release-2482c5c`. Keep checkpoints,
+datasets, secrets and generated rollouts outside Git.
 
 ```bash
 git clone https://github.com/Hsch22/vit-h-ppo.git
 cd vit-h-ppo
 ```
 
-Follow the deployment guide before installing dependencies or downloading
-weights. Public read access does not grant push access; the repository owner
-must add teammates as collaborators if they will push branches directly.
+Follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) to set up environments and download the upstream base/preprocessing assets (`vith_offline_g1.ckpt`, YOLO, ViTPose, SAM3D, and the SONIC ONNX tracker).
 
 ---
 
