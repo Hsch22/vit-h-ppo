@@ -88,6 +88,12 @@ def parse_args():
         default="cosine",
         help="Overlap blending schedule when --overlap > 1.",
     )
+    parser.add_argument(
+        "--sync-mode",
+        choices=("multidiffusion", "none", "inpainting"),
+        default="multidiffusion",
+        help="Overlap denoising synchronization mode ('multidiffusion'=recommended bidirectional joint denoising, 'none'=independent windows, 'inpainting'=causal prefix lock).",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -242,6 +248,7 @@ def infer_video(
     singular_rewrite="none",
     align_mode="so3",
     blend_mode="cosine",
+    sync_mode="none",
 ):
     import torch
     import torch.nn.functional as F
@@ -249,8 +256,11 @@ def infer_video(
         matrix_to_quaternion,
         quaternion_to_matrix,
     )
-    from post_training.stitching import stitch_sequence_yup
+    from post_training.stitching import sample_ddim_synchronized, stitch_sequence_yup
     from tools.inference_utils import reduce_singular_chains
+
+    if sync_mode not in ("none", "multidiffusion", "inpainting"):
+        raise ValueError(f"Unsupported sync_mode {sync_mode!r}")
 
     obs_full = prep["obs_full"]
     bbx_xys_full = prep["bbx_xys_full"]
@@ -273,39 +283,96 @@ def infer_video(
         return torch.cat([x, x[-1:].expand(pad_len, *x.shape[1:])], dim=0)
 
     n_chunks = len(chunks_meta)
-    jp_chunks = torch.zeros(n_chunks, window, 29, device=device)
-    rp_chunks = torch.zeros(n_chunks, window, 3, device=device)
-    rq_chunks = torch.zeros(n_chunks, window, 4, device=device)
-    bp_chunks = None
+    use_sync = sync_mode != "none" and n_chunks > 1
 
-    for chunk_idx, (start, actual_len) in enumerate(chunks_meta):
-        end = start + actual_len
-        pad_len = window - actual_len
-        obs = pad_window(obs_full[start:end], pad_len).to(device)
-        bbx_xys = pad_window(bbx_xys_full[start:end], pad_len).to(device)
-        K_fullimg = pad_window(K_fullimg_full[start:end], pad_len).to(device)
-        cam_angvel = pad_window(cam_angvel_full[start:end], pad_len).to(device)
-        f_imgseq = pad_window(f_imgseq_full[start:end], pad_len).to(device)
+    if use_sync:
+        if not (hasattr(pipeline, "denoiser3d") and hasattr(pipeline, "train_diffusion")):
+            raise ValueError(f"sync_mode={sync_mode!r} requires a diffusion pipeline with denoiser3d and train_diffusion")
+        from post_training.eval_compare import build_condition
+        from post_training.eval_long_horizon import _decode_chunks_yup
+        from post_training.policy import G1_PRED_X_DIM
 
-        batch = {
-            "length": torch.tensor([actual_len], device=device, dtype=torch.long),
-            "obs": obs.unsqueeze(0),
-            "bbx_xys": bbx_xys.unsqueeze(0),
-            "K_fullimg": K_fullimg.unsqueeze(0),
-            "cam_angvel": cam_angvel.unsqueeze(0),
-            "f_imgseq": f_imgseq.unsqueeze(0),
+        obs_b, bbx_b, K_b, ang_b, feat_b, len_b = [], [], [], [], [], []
+        for start, actual_len in chunks_meta:
+            end = start + actual_len
+            pad_len = window - actual_len
+            obs_b.append(pad_window(obs_full[start:end], pad_len))
+            bbx_b.append(pad_window(bbx_xys_full[start:end], pad_len))
+            K_b.append(pad_window(K_fullimg_full[start:end], pad_len))
+            ang_b.append(pad_window(cam_angvel_full[start:end], pad_len))
+            feat_b.append(pad_window(f_imgseq_full[start:end], pad_len))
+            len_b.append(actual_len)
+
+        dev = torch.device(device)
+        use_bf16 = dev.type == "cuda"
+        batch_gpu = {
+            "obs": torch.stack(obs_b, dim=0).to(dev),
+            "bbx_xys": torch.stack(bbx_b, dim=0).to(dev),
+            "K_fullimg": torch.stack(K_b, dim=0).to(dev),
+            "cam_angvel": torch.stack(ang_b, dim=0).to(dev),
+            "f_imgseq": torch.stack(feat_b, dim=0).to(dev),
+            "f_imgseq_mask": torch.ones((n_chunks,), dtype=torch.bool, device=dev),
+            "length": torch.tensor(len_b, dtype=torch.long, device=dev),
         }
+        f_cond, length_t, all_valid = build_condition(pipeline, batch_gpu, use_bf16=use_bf16)
+        x_inits = torch.randn((n_chunks, window, G1_PRED_X_DIM), device=dev, dtype=torch.float32)
+        ddim_steps = int(getattr(pipeline, "test_diffusion_steps", 50))
+        ddim_eta = float(getattr(pipeline, "ddim_eta", 0.0))
+        sync_w_mode = "cosine" if blend_mode == "cosine" else "uniform"
+        x0_chunks = sample_ddim_synchronized(
+            pipeline=pipeline,
+            denoiser=pipeline.denoiser3d,
+            f_cond=f_cond,
+            length=length_t,
+            x_init=x_inits,
+            chunks_meta=chunks_meta,
+            total_len=total_len,
+            ddim_steps=ddim_steps,
+            eta=ddim_eta,
+            all_valid_length=all_valid,
+            use_bf16=use_bf16,
+            sync_mode=sync_mode,
+            sync_weight_mode=sync_w_mode,
+        )
+        pelvis_h = float(getattr(getattr(getattr(pipeline, "args", None), "robot", None), "default_pelvis_height", 0.793))
+        root0_chunks = torch.tensor([[[0.0, pelvis_h, 0.0]]], device=dev, dtype=torch.float32).expand(n_chunks, 1, 3)
+        jp_chunks, rp_chunks, rq_chunks, bp_chunks = _decode_chunks_yup(
+            pipeline, x0_chunks, batch_gpu["cam_angvel"], length_t, root0_chunks
+        )
+    else:
+        jp_chunks = torch.zeros(n_chunks, window, 29, device=device)
+        rp_chunks = torch.zeros(n_chunks, window, 3, device=device)
+        rq_chunks = torch.zeros(n_chunks, window, 4, device=device)
+        bp_chunks = None
 
-        outputs = pipeline.forward(batch, train=False)
-        jp_chunks[chunk_idx, :actual_len] = outputs["pred_g1_joint_pos"][0, :actual_len]
-        rp_chunks[chunk_idx, :actual_len] = outputs["pred_root_pos"][0, :actual_len]
-        rq_chunks[chunk_idx, :actual_len] = outputs["pred_root_quat_w"][0, :actual_len]
-        pred_body = outputs.get("pred_g1_body_pos_w")
-        if pred_body is not None:
-            pred_body = pred_body[0, :actual_len]
-            if bp_chunks is None:
-                bp_chunks = torch.zeros(n_chunks, window, pred_body.shape[1], 3, device=device)
-            bp_chunks[chunk_idx, :actual_len] = pred_body
+        for chunk_idx, (start, actual_len) in enumerate(chunks_meta):
+            end = start + actual_len
+            pad_len = window - actual_len
+            obs = pad_window(obs_full[start:end], pad_len).to(device)
+            bbx_xys = pad_window(bbx_xys_full[start:end], pad_len).to(device)
+            K_fullimg = pad_window(K_fullimg_full[start:end], pad_len).to(device)
+            cam_angvel = pad_window(cam_angvel_full[start:end], pad_len).to(device)
+            f_imgseq = pad_window(f_imgseq_full[start:end], pad_len).to(device)
+
+            batch = {
+                "length": torch.tensor([actual_len], device=device, dtype=torch.long),
+                "obs": obs.unsqueeze(0),
+                "bbx_xys": bbx_xys.unsqueeze(0),
+                "K_fullimg": K_fullimg.unsqueeze(0),
+                "cam_angvel": cam_angvel.unsqueeze(0),
+                "f_imgseq": f_imgseq.unsqueeze(0),
+            }
+
+            outputs = pipeline.forward(batch, train=False)
+            jp_chunks[chunk_idx, :actual_len] = outputs["pred_g1_joint_pos"][0, :actual_len]
+            rp_chunks[chunk_idx, :actual_len] = outputs["pred_root_pos"][0, :actual_len]
+            rq_chunks[chunk_idx, :actual_len] = outputs["pred_root_quat_w"][0, :actual_len]
+            pred_body = outputs.get("pred_g1_body_pos_w")
+            if pred_body is not None:
+                pred_body = pred_body[0, :actual_len]
+                if bp_chunks is None:
+                    bp_chunks = torch.zeros(n_chunks, window, pred_body.shape[1], 3, device=device)
+                bp_chunks[chunk_idx, :actual_len] = pred_body
 
     has_body = bp_chunks is not None
     bp_in = bp_chunks if has_body else torch.zeros(n_chunks, window, 1, 3, device=device)
@@ -434,6 +501,7 @@ def main():
             singular_rewrite=args.singular_rewrite,
             align_mode=args.align_mode,
             blend_mode=args.blend_mode,
+            sync_mode=args.sync_mode,
         )
 
     required_lengths = {
@@ -473,6 +541,7 @@ def main():
         stitch_overlap=np.array(int(args.overlap), dtype=np.int32),
         stitch_align_mode=args.align_mode,
         stitch_blend_mode=args.blend_mode,
+        stitch_sync_mode=args.sync_mode,
     )
     print(f"Saved: {output}")
     print(f"joint_pos: {results['joint_pos'].shape}")
