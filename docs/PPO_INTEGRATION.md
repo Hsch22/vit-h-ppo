@@ -48,14 +48,15 @@ conversion, normalization statistics, and frame rate. See
 [export conversion](../tools/infer_video.py#L322) and
 [tracker input schema](../g1_tracker/README.md#input).
 
-Long-video inference supports configurable multi-frame overlap stitching via
-[stitching.py](../post_training/stitching.py) and
+Long-video inference supports configurable multi-frame overlap stitching and
+synchronized denoising via [stitching.py](../post_training/stitching.py) and
 [infer_video.py](../tools/infer_video.py). By default, `tools/infer_video.py`
-uses `--overlap 16 --align-mode yaw --blend-mode cosine` (gravity-preserving
+uses `--overlap 16 --align-mode yaw --blend-mode cosine --sync-mode multidiffusion`
+(shared-noise bidirectional MultiDiffusion `pred_x0` fusion, gravity-preserving
 Y-axis alignment, raised-cosine joint/root blending, geodesic quaternion SLERP,
 and exact `fk_g1` body-link recomputation); passing
-`--overlap 1 --align-mode so3` reproduces the legacy 1-frame rigid endpoint
-alignment (`align_window_to_previous`) bit-for-bit.
+`--overlap 1 --align-mode so3 --sync-mode none` reproduces the legacy 1-frame
+rigid endpoint alignment (`align_window_to_previous`) bit-for-bit.
 
 ## Checkpoint and feature compatibility
 

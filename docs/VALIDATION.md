@@ -309,12 +309,27 @@ Key findings from the 3-factor additive decomposition:
 - **Gravity-preserving `yaw`-only alignment (`so3 -> yaw` at `ov16`, `Base`)**: adds `+13/-5` passes and cuts `exec_root_err` another `-26.1 mm` (`t=-2.92`), eliminating pitch/roll floor-plane tilt accumulation across windows (on `600+f` sequences `exec_root_err` drops from `1.365 m -> 0.746 m`).
 - **Hard-clip PPO (`step 1200`) stacks additively on top of `ov16_yaw_cosine`**: adds `+6/-1` passes (`92.09% -> 93.37%`, matching the GT ceiling overall and on `600+f` at `64.71%` with `0` near-seam failures) and further improves `exec_jmae` (`0.1056 -> 0.1035 rad`, `t=-6.37`, `72.7%` better).
 
-3. **Real 300-frame dancing video (`tools/infer_video.py`, `seed=42`, `3 chunks` for both `ov1` and `ov16`)**:
-   All runs passed Protocol v4 (`is_success=True`). Switching from legacy `ov1_so3` to default `ov16_yaw_cosine` cut `SeamPeak` `-34.7%` (`0.1040 -> 0.0679 rad` on Base; `0.0664 rad` on Hard-PPO `step 1200`), cut `OvMean` `-51.3%` (`0.1040 -> 0.0507 rad`; `0.0489 rad` on Hard-PPO `step 1200`), and achieved the lowest `exec_jmae` (`0.1630 rad` on Hard-PPO `step 1200 + ov16_yaw` vs `0.1699 rad` on `Base + ov1_so3`). On this single clip, shifted chunk boundaries increased horizontal `xy` displacement (`0.141 -> 0.201 m` on Base) while preserving vertical stability (`z_span = 0.179–0.182 m`); under identical `ov16_yaw` boundaries, Hard-PPO `step 900` (`0.2111 m`, `-41.3 mm`) and `step 1200` (`0.2235 m`, `-28.9 mm`) both reduced root error vs `Base` (`0.2524 m`).
+3. **Overlap-region synchronized denoising (`post_training/stitching.py::sample_ddim_synchronized`)**:
+   Source audit + numerical verification on a 240-frame `bedlam2` sequence with independent random window yaw (+1 rad) and translation confirmed all 189 diffusion dims are window-invariant (`body_pose_r6d [0:174]`: `0.00e+00`, `global_orient_c [174:180]`: `1.61e-06`, `global_orient_gv [180:186]` in per-frame `GV_t`: `2.74e-06`, `local_transl_vel [186:189]` on `0..ov-2`: `3.38e-05`; only frame `ov-1` of the earlier window carries last-frame velocity padding `6.62e-02` and is left controlled by the later window).
+
+   - **`test` (`n = 392`, `>=240f`, `ov16_yaw_cosine`, `DDIM-50 eta=0.0`)**:
+     - **`ov16_multidiff` + `Hard-PPO (step 1200)`**: **`94.13%` (`23 fails`, exceeds GT `93.37%` / `26 fails`, `Pass|GT = 95.90%`)**, `+3/-0` vs `ov16_none` (`+28/-3`, McNemar `p = 4.65e-6` vs `Base ov1_so3`), `PreOvErr = 0.00000 rad` (from `0.05834`), `OvMean = 0.0148 rad` (`t = -16.06`, `88.8%` improved; `0.0145 rad` with `ov24_multidiff`), `SeamPeak = 0.0229 rad` (`t = -6.10`), runtime overhead `+0.9%` (`1850s` vs `1833s`).
+     - **Causal prefix `inpainting` (`r1` / `r2`)**: eliminated `PreOvErr`, but hard prefix masking spiked `SeamPeak` `+61%` (`0.0234 -> 0.0376–0.0391 rad`, `t = +37.0`), left `OvMean` flat (`0.0153 rad`), ran `1.8x–2.3x` slower, and `r2` degraded pass rate (`93.37% -> 91.58%`).
+   - **`val` 3-seed confirmation gate (`n = 401` `>=240f` sequences × seeds `2026/2027/2028` = `1,203` trials/config, GT ceiling `88.03%`, clustered bootstrap 95% CI `B=10,000`)**:
+     - `Base`: `ov16_none` `88.94%` (`95% CI [85.79%, 91.77%]`) -> `ov16_multidiff` **`89.36%`** (`95% CI [86.28%, 92.10%]`), paired `ΔPass = +0.42%` (`95% CI [-0.42%, +1.25%]`, `+12/-7`), `ΔOvMean = -0.00054 rad` (`t = -19.34`, `92.3%` better), `ΔSeamPeak = -0.00024 rad` (`t = -3.25`, `74.3%` better).
+     - `Hard-PPO (step 1200)`: `ov16_none` `89.94%` (`95% CI [86.95%, 92.68%]`, `seed_std=0.52%`) -> `ov16_multidiff` **`90.27%`** (`95% CI [87.28%, 93.02%]`, `seed_std=0.25%`), paired `ΔPass = +0.33%` (`95% CI [-0.25%, +0.91%]`, `+8/-4`), `ΔOvMean = -0.00052 rad` (`t = -18.91`, `92.8%` better), `ΔSeamPeak = -0.00031 rad` (`t = -5.68`, `77.1%` better), `ΔRootErr = -0.72 mm`.
+     - Gate passed without regression on both models; `--sync-mode multidiffusion` promoted to default in `tools/infer_video.py`.
+
+4. **8 real-world multi-window dance videos × 3 seeds (`42/43/44`, `24` trials/method = `120` trajectories; original 300f dance + 7 `MCG-NJU/X-Dance` videos `200f–361f @ 30fps`)**:
+   - `Base + ov1_so3` (legacy): `95.83%` (`23/24`), `RootErr = 0.2844 m`, `JMAE = 0.1639 rad`, `SeamPeak = 0.1507 rad`, `OvMean = 0.1507 rad`.
+   - `Base + ov16_yaw (none)`: `100.00%` (`24/24`), `RootErr = 0.2527 m`, `JMAE = 0.1589 rad`, `SeamPeak = 0.0496 rad`, `OvMean = 0.0353 rad`.
+   - `Base + ov16_yaw + multidiff`: `100.00%` (`24/24`), **`RootErr = 0.2391 m`** (`-45.3 mm`), `JMAE = 0.1618 rad`, `SeamPeak = 0.0502 rad`, `OvMean = 0.0354 rad`.
+   - `Hard-PPO (1200) + ov16_yaw (none)`: `100.00%` (`24/24`), `RootErr = 0.2476 m`, **`JMAE = 0.1555 rad`**, **`SeamPeak = 0.0482 rad`**, **`OvMean = 0.0343 rad`**.
+   - `Hard-PPO (1200) + ov16_yaw + multidiff`: **`100.00%` (`24/24`)**, `RootErr = 0.2475 m` (`-36.9 mm`; `-243 mm` on 361f `XDance_Complex_00007` and `-42 mm` on 300f `dancing_orig`), `JMAE = 0.1580 rad`, `SeamPeak = 0.0487 rad` (`-67.7%`), **`OvMean = 0.0343 rad`** (`-77.2%`, close to interior `0.0319 rad`).
 
 ### Remaining open research questions
 
-- The combination of **Hard-clip decomposed-reward PPO (`step 900`–`1200`) + `ov16_yaw_cosine` inference stitching** now matches the untouched `test` long-horizon GT pass-rate ceiling (`93.37%`, `Pass|GT = 95.08%`, `exec_root_err = 0.1862 m`) while improving short-window `Bucket A` pass rate (`3/22 -> 6–7/22`) and `640`-clip pass rate (`98.59% -> 98.91%`, `+2/-0`).
+- The combination of **Hard-clip decomposed-reward PPO (`step 900`–`1200`) + `ov16_yaw_cosine` + `MultiDiffusion` inference** exceeds the untouched `test` (`94.13%` vs GT `93.37%`) and 3-seed `val` (`90.27%` vs GT `88.03%`) long-horizon pass-rate ceilings and achieves `24/24 (100%)` across 8 real-world dance videos.
 - Remaining headroom is concentrated in:
   1. Expanding dynamic hard-clip coverage beyond the `407`-clip `Bucket A` pool (to prevent late-step overfitting past ~900–1200 PPO steps);
   2. Prefix-conditioned / inpainting window continuation if tighter cross-window pose coupling is needed on ultra-long (`600+f`) out-of-domain videos.
