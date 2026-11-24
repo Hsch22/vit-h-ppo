@@ -97,6 +97,12 @@ class PPOVithClipWrapper(Dataset):
         gt_body_yup = g1["g1_body_pos_w"].float()
         gt_body_zup = gt_body_yup @ self._m_pos
         root_pos_0_yup = gt_body_yup[0:1, 0, :].clone()
+        from motion_lib.motion_utils.rotation_conversions import matrix_to_quaternion, quaternion_to_matrix
+
+        gt_rq_y = g1["g1_body_quat_w"][:, 0, :].float()
+        gt_rq_z = torch.nn.functional.normalize(
+            matrix_to_quaternion(self._m_pos.T @ quaternion_to_matrix(gt_rq_y)), dim=-1
+        )
         return {
             "length": torch.as_tensor(sample["length"], dtype=torch.long),
             "obs": obs,
@@ -108,6 +114,7 @@ class PPOVithClipWrapper(Dataset):
             "root_pos_0_yup": root_pos_0_yup,
             "gt_joint_pos": g1["g1_joint_pos"].float(),
             "gt_body_pos_z": gt_body_zup,
+            "gt_root_quat_z": gt_rq_z,
             "fps": sample["fps"].float(),
         }
 
@@ -185,11 +192,15 @@ class HardClipDistributedSampler(Sampler[int]):
         share_a: float = 0.20,
         share_b: float = 0.55,
         share_c: float = 0.25,
+        static_source_share: float = 0.0,
+        static_sources: tuple[str, ...] = ("h36m",),
         num_samples_per_epoch: int | None = None,
         seed: int = 42,
     ) -> None:
         if share_a < 0 or share_b < 0 or share_c < 0 or (share_a + share_b + share_c) <= 0:
             raise ValueError(f"Invalid bucket shares: {(share_a, share_b, share_c)}")
+        if not (0.0 <= float(static_source_share) < 1.0):
+            raise ValueError(f"static_source_share must be in [0, 1), got {static_source_share}")
         data = json.loads(Path(hard_index_path).read_text(encoding="utf-8"))
         buckets = data["buckets"]
 
@@ -200,22 +211,34 @@ class HardClipDistributedSampler(Sampler[int]):
         ]
         indices: list[int] = []
         weights: list[float] = []
+        is_static: list[bool] = []
         self.bucket_counts: dict[str, int] = {}
+        static_set = set(static_sources)
         for name, share in bucket_specs:
             entries = buckets.get(name, [])
-            valid_ids = [int(e["global_idx"]) for e in entries if 0 <= int(e["global_idx"]) < dataset_len]
-            self.bucket_counts[name] = len(valid_ids)
-            if valid_ids and share > 0.0:
-                per_item = share / len(valid_ids)
-                indices.extend(valid_ids)
-                weights.extend([per_item] * len(valid_ids))
+            valid_entries = [e for e in entries if 0 <= int(e["global_idx"]) < dataset_len]
+            self.bucket_counts[name] = len(valid_entries)
+            if valid_entries and share > 0.0:
+                per_item = share / len(valid_entries)
+                for e in valid_entries:
+                    indices.append(int(e["global_idx"]))
+                    weights.append(per_item)
+                    is_static.append(str(e.get("source", "")) in static_set)
         self.excluded_untrackable = len(buckets.get("untrackable_gt", []))
         if not indices:
             raise ValueError(f"No valid training clips found in hard index {hard_index_path}")
 
         w_arr = np.asarray(weights, dtype=np.float64)
+        w_arr = w_arr / w_arr.sum()
+        static_mask = np.asarray(is_static, dtype=np.bool_)
+        if float(static_source_share) > 0.0 and bool(static_mask.any()) and bool((~static_mask).any()):
+            cur_static = float(w_arr[static_mask].sum())
+            cur_other = float(w_arr[~static_mask].sum())
+            w_arr[static_mask] *= float(static_source_share) / cur_static
+            w_arr[~static_mask] *= (1.0 - float(static_source_share)) / cur_other
         self._indices = np.asarray(indices, dtype=np.int64)
         self._probs = w_arr / w_arr.sum()
+        self.effective_static_share = float(self._probs[static_mask].sum()) if bool(static_mask.any()) else 0.0
         self.num_replicas = int(num_replicas)
         self.rank = int(rank)
         self.seed = int(seed)

@@ -36,6 +36,7 @@ from post_training import (
     POLICY_SINGLE_WINDOW,
     REWARD_COMBINED_TRACK,
     REWARD_DECOMPOSED_VEL,
+    REWARD_ROOT_ANCHORED,
 )
 from post_training.dataset import (
     HardClipDistributedSampler,
@@ -49,6 +50,7 @@ from post_training.reward import (
     compute_group_advantages,
     compute_sample_rewards,
     make_decomposed_vel_reward_weights,
+    make_root_anchored_reward_weights,
 )
 from post_training.tracker_pool import PersistentTrackerPool
 from tools.inference_utils import load_pipeline
@@ -215,6 +217,8 @@ def run_validation(
             lengths=lens,
             weights=reward_weights,
             fps=fps_np,
+            pred_root_quat_z=rq,
+            gt_root_quat_z=batch["gt_root_quat_z"].numpy() if "gt_root_quat_z" in batch else None,
         )
         all_valid_flags.extend(scored["is_valid"].tolist())
         all_succ.extend(scored["is_success"].tolist())
@@ -304,6 +308,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update-steps-per-epoch", type=int, default=10)
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument("--kl-coef", type=float, default=0.04)
+    parser.add_argument("--kl-root-weight", type=float, default=1.0, help="KL multiplier on coupled root dims [180:189]")
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--min-lr", type=float, default=0.0)
     parser.add_argument("--warmup-steps", type=int, default=0)
@@ -322,15 +327,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--share-a", type=float, default=0.20)
     parser.add_argument("--share-b", type=float, default=0.55)
     parser.add_argument("--share-c", type=float, default=0.25)
+    parser.add_argument("--static-source-share", type=float, default=0.0, help="Target probability share for static-cam h36m clips (0 = default)")
     parser.add_argument("--val-hard-index", type=Path, default=None)
     parser.add_argument("--val-max-bucket-b", type=int, default=107)
 
-    # Reward weights (`combined_track` or `decomposed_vel`)
+    # Reward weights (`combined_track`, `decomposed_vel`, or `decomposed_vel_root_anchored`)
     parser.add_argument(
         "--reward-mode",
         type=str,
         default=REWARD_DECOMPOSED_VEL,
-        choices=(REWARD_COMBINED_TRACK, REWARD_DECOMPOSED_VEL),
+        choices=(REWARD_COMBINED_TRACK, REWARD_DECOMPOSED_VEL, REWARD_ROOT_ANCHORED),
     )
     parser.add_argument("--w-success", type=float, default=1.0)
     parser.add_argument("--w-survival", type=float, default=0.5)
@@ -339,6 +345,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-exec-joint", type=float, default=0.8)
     parser.add_argument("--w-fidelity", type=float, default=1.0)
     parser.add_argument("--w-vel-fidelity", type=float, default=0.3)
+    parser.add_argument("--w-root-z-traj", type=float, default=0.4)
+    parser.add_argument("--w-root-vel-xy", type=float, default=0.3)
+    parser.add_argument("--w-gv-tilt", type=float, default=0.3)
+    parser.add_argument("--w-exec-slip", type=float, default=0.3)
 
     # Hopper H100 optimizations
     parser.add_argument("--no-bf16", action="store_true")
@@ -445,8 +455,22 @@ def main() -> None:
         eta=args.ddim_eta,
         use_bf16=(not args.no_bf16),
         device=device,
+        kl_root_weight=args.kl_root_weight,
     )
-    if args.reward_mode == REWARD_DECOMPOSED_VEL:
+    if args.reward_mode == REWARD_ROOT_ANCHORED:
+        reward_weights = make_root_anchored_reward_weights(
+            w_success=args.w_success,
+            w_survival=args.w_survival,
+            w_exec_root=args.w_exec_root,
+            w_exec_joint=args.w_exec_joint,
+            w_fidelity=args.w_fidelity,
+            w_vel_fidelity=args.w_vel_fidelity,
+            w_root_z_traj=args.w_root_z_traj,
+            w_root_vel_xy=args.w_root_vel_xy,
+            w_gv_tilt=args.w_gv_tilt,
+            w_exec_slip=args.w_exec_slip,
+        )
+    elif args.reward_mode == REWARD_DECOMPOSED_VEL:
         reward_weights = make_decomposed_vel_reward_weights(
             w_success=args.w_success,
             w_survival=args.w_survival,
@@ -502,6 +526,7 @@ def main() -> None:
             share_a=args.share_a,
             share_b=args.share_b,
             share_c=args.share_c,
+            static_source_share=args.static_source_share,
             num_samples_per_epoch=max(len(train_ds), args.max_steps * args.prompts_per_rank * world_size),
             seed=args.seed,
         )
@@ -509,7 +534,9 @@ def main() -> None:
             print(
                 f"[HardSampler] buckets={train_sampler.bucket_counts} "
                 f"excluded_untrackable_gt={train_sampler.excluded_untrackable} "
-                f"shares=({args.share_a:.2f}, {args.share_b:.2f}, {args.share_c:.2f})",
+                f"shares=({args.share_a:.2f}, {args.share_b:.2f}, {args.share_c:.2f}) "
+                f"effective_static_share={train_sampler.effective_static_share:.3f} "
+                f"kl_root_weight={args.kl_root_weight:.1f}",
                 flush=True,
             )
     else:
@@ -717,6 +744,11 @@ def main() -> None:
             trk_res = tracker_pool.evaluate_batch(jp_np, rp_np, rq_np, bp_np, lens_np, fps=fps_rep)
             gt_jp_rep = np.repeat(batch["gt_joint_pos"].numpy(), args.group_size, axis=0)
             gt_bp_rep = np.repeat(batch["gt_body_pos_z"].numpy(), args.group_size, axis=0)
+            gt_rq_rep = (
+                np.repeat(batch["gt_root_quat_z"].numpy(), args.group_size, axis=0)
+                if "gt_root_quat_z" in batch
+                else None
+            )
             scored = compute_sample_rewards(
                 tracker_results=trk_res,
                 pred_joint_pos=jp_np,
@@ -726,6 +758,8 @@ def main() -> None:
                 lengths=lens_np,
                 weights=reward_weights,
                 fps=fps_rep,
+                pred_root_quat_z=rq_np,
+                gt_root_quat_z=gt_rq_rep,
             )
             tracker_s = time.perf_counter() - t1
 
@@ -817,6 +851,10 @@ def main() -> None:
                 "train/mean_joint_vel_rad_s": _all_reduce_mean(_valid_avg(scored["mean_joint_vel_rad_s"]), device, world_size),
                 "train/ref_joint_mae_rad": _all_reduce_mean(_valid_avg(scored["ref_joint_mae_rad"]), device, world_size),
                 "train/ref_body_mpjpe_m": _all_reduce_mean(_valid_avg(scored["ref_body_mpjpe_m"]), device, world_size),
+                "train/root_z_traj_err_m": _all_reduce_mean(_valid_avg(scored["root_z_traj_err_m"]), device, world_size),
+                "train/root_vel_xy_err_m_s": _all_reduce_mean(_valid_avg(scored["root_vel_xy_err_m_s"]), device, world_size),
+                "train/gv_tilt_err": _all_reduce_mean(_valid_avg(scored["gv_tilt_err"]), device, world_size),
+                "train/exec_foot_slip_cm_s": _all_reduce_mean(_valid_avg(scored["exec_foot_slip_cm_s"]), device, world_size),
                 "train/invalid_rate": _all_reduce_mean(1.0 - float(valid_mask.mean()), device, world_size),
                 "train/pg_loss": _all_reduce_mean(float(np.mean(ppo_losses)), device, world_size),
                 "train/kl_div": _all_reduce_mean(float(np.mean(kl_vals)), device, world_size),

@@ -515,6 +515,107 @@ class TestPPOComponents(unittest.TestCase):
                 self.assertLess(pose_err, 1e-5)
                 self.assertLess(vel_err, 1e-5)
 
+    def test_subspace_kl_weighting_preserves_logprob_and_amplifies_root_kl(self) -> None:
+        from post_training.policy import G1_ROOT_SUBSPACE_START, StochasticDDIMPolicy
+
+        pipe = _make_fake_pipeline(100)
+        pol_unif = StochasticDDIMPolicy(pipe, ddim_steps=6, eta=0.7, use_bf16=False, device="cpu", kl_root_weight=1.0)
+        pol_root = StochasticDDIMPolicy(pipe, ddim_steps=6, eta=0.7, use_bf16=False, device="cpu", kl_root_weight=8.0)
+
+        self.assertIsNone(pol_unif.kl_dim_weights)
+        self.assertIsNotNone(pol_root.kl_dim_weights)
+        assert pol_root.kl_dim_weights is not None
+        self.assertAlmostEqual(float(pol_root.kl_dim_weights.mean().item()), 1.0, places=6)
+        ratio = float(pol_root.kl_dim_weights[0, 0, G1_ROOT_SUBSPACE_START].item() / pol_root.kl_dim_weights[0, 0, 0].item())
+        self.assertAlmostEqual(ratio, 8.0, places=5)
+
+        valid = torch.ones((2, 8), dtype=torch.bool)
+        std = torch.tensor(0.5)
+        base_m = torch.zeros((2, 8, 189))
+        # Perturb only root subspace [180:189] vs only pose [0:9]
+        p_root = base_m.clone()
+        p_root[..., G1_ROOT_SUBSPACE_START:] = 0.2
+        p_pose = base_m.clone()
+        p_pose[..., :9] = 0.2
+
+        kl_u_root = pol_unif.analytic_gaussian_kl(p_root, base_m, std, valid, dim_weights=pol_unif.kl_dim_weights)
+        kl_u_pose = pol_unif.analytic_gaussian_kl(p_pose, base_m, std, valid, dim_weights=pol_unif.kl_dim_weights)
+        self.assertTrue(torch.allclose(kl_u_root, kl_u_pose, atol=1e-6))
+
+        kl_w_root = pol_root.analytic_gaussian_kl(p_root, base_m, std, valid, dim_weights=pol_root.kl_dim_weights)
+        kl_w_pose = pol_root.analytic_gaussian_kl(p_pose, base_m, std, valid, dim_weights=pol_root.kl_dim_weights)
+        self.assertAlmostEqual(float((kl_w_root / kl_w_pose).mean().item()), 8.0, places=5)
+
+    def test_root_anchored_reward_z_drift_tilt_and_slip(self) -> None:
+        from post_training.reward import compute_sample_rewards, make_root_anchored_reward_weights
+
+        L = 20
+        gt_jp = np.zeros((3, L, 29), dtype=np.float32)
+        gt_bp = np.zeros((3, L, 30, 3), dtype=np.float32)
+        gt_bp[:, :, 0, 2] = 0.78  # constant standing pelvis height
+        gt_bp[:, :, 1, 0] = 0.10  # non-zero forward body landmark for yaw alignment
+        gt_rq = np.zeros((3, L, 4), dtype=np.float32)
+        gt_rq[..., 0] = 1.0  # upright identity quaternion
+
+        pred_bp = gt_bp.copy()
+        pred_rq = gt_rq.copy()
+        # Sample 0: perfect match + pure 90-deg yaw (must have 0 tilt error!)
+        pred_rq[0, :, 0] = np.cos(np.pi / 4.0)
+        pred_rq[0, :, 3] = np.sin(np.pi / 4.0)
+        # Sample 1: 0.12 m Z-height drift + 10-deg pitch tilt
+        pred_bp[1, :, :, 2] += np.linspace(0.0, 0.12, L, dtype=np.float32)[:, None]
+        ang = np.deg2rad(10.0)
+        pred_rq[1, :, 0] = np.cos(ang / 2.0)
+        pred_rq[1, :, 2] = np.sin(ang / 2.0)
+        # Sample 2: identical kinematics to sample 0, but high physical MuJoCo foot slip
+        trk = [
+            {"valid": True, "is_success": True, "first_failure_frame_50hz": -1, "total_frames_50hz": 33, "exec_joint_mae_rad": 0.05, "exec_root_pos_err_m": 0.05, "exec_foot_slip_cm_s": 1.0},
+            {"valid": True, "is_success": True, "first_failure_frame_50hz": -1, "total_frames_50hz": 33, "exec_joint_mae_rad": 0.05, "exec_root_pos_err_m": 0.05, "exec_foot_slip_cm_s": 1.0},
+            {"valid": True, "is_success": True, "first_failure_frame_50hz": -1, "total_frames_50hz": 33, "exec_joint_mae_rad": 0.05, "exec_root_pos_err_m": 0.05, "exec_foot_slip_cm_s": 8.0},
+        ]
+        w = make_root_anchored_reward_weights()
+        out = compute_sample_rewards(
+            trk, gt_jp, pred_bp, gt_jp, gt_bp, np.array([L, L, L]), weights=w, fps=30.0,
+            pred_root_quat_z=pred_rq, gt_root_quat_z=gt_rq,
+        )
+        # Sample 0 has zero tilt & zero Z drift -> strictly highest reward
+        self.assertAlmostEqual(float(out["gv_tilt_err"][0]), 0.0, places=5)
+        self.assertAlmostEqual(float(out["root_z_traj_err_m"][0]), 0.0, places=5)
+        self.assertGreater(float(out["gv_tilt_err"][1]), 0.15)
+        self.assertGreater(float(out["root_z_traj_err_m"][1]), 0.08)
+        self.assertGreater(float(out["reward"][0]), float(out["reward"][1]))
+        self.assertGreater(float(out["reward"][0]), float(out["reward"][2]))
+
+    def test_hard_sampler_static_source_share(self) -> None:
+        import json, tempfile
+        from pathlib import Path
+        from post_training.dataset import HardClipDistributedSampler
+
+        idx_data = {
+            "buckets": {
+                "bucket_a_fixable_fail": [
+                    {"global_idx": 0, "source": "h36m"},
+                    {"global_idx": 1, "source": "bedlam2"},
+                    {"global_idx": 2, "source": "bedlam2"},
+                ],
+                "bucket_b_high_exec_err": [
+                    {"global_idx": 3, "source": "h36m"},
+                    {"global_idx": 4, "source": "bedlam"},
+                    {"global_idx": 5, "source": "bedlam2"},
+                ],
+                "bucket_c_easy_pass": [
+                    {"global_idx": 6, "source": "bedlam"},
+                    {"global_idx": 7, "source": "bedlam2"},
+                ],
+                "untrackable_gt": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "hard_index.json"
+            p.write_text(json.dumps(idx_data))
+            s = HardClipDistributedSampler(p, dataset_len=8, static_source_share=0.20)
+            self.assertAlmostEqual(s.effective_static_share, 0.20, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

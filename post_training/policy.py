@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 
 G1_PRED_X_DIM = 189
+G1_ROOT_SUBSPACE_START = 180  # [180:186] global_orient_gv (6D) + [186:189] local_transl_vel (3D)
 
 # Exact Y-up -> G1 Z-up matrix from tools/infer_video.py lines 323-332.
 YUP_TO_ZUP_M = (
@@ -63,13 +64,24 @@ class StochasticDDIMPolicy:
         eta: float = 0.7,
         use_bf16: bool = True,
         device: torch.device | str = "cuda",
+        kl_root_weight: float = 1.0,
     ) -> None:
         if not (0.0 < float(eta) <= 1.0):
             raise ValueError(f"PPO stochastic DDIM requires 0 < eta <= 1.0, got {eta}")
+        if float(kl_root_weight) <= 0.0:
+            raise ValueError(f"kl_root_weight must be > 0, got {kl_root_weight}")
         self.device = torch.device(device)
         self.eta = float(eta)
         self.ddim_steps = int(ddim_steps)
         self.use_bf16 = bool(use_bf16) and self.device.type == "cuda"
+        self.kl_root_weight = float(kl_root_weight)
+        dim_w = torch.ones((G1_PRED_X_DIM,), dtype=torch.float32, device=self.device)
+        if self.kl_root_weight != 1.0:
+            dim_w[G1_ROOT_SUBSPACE_START:] = self.kl_root_weight
+            dim_w = dim_w / dim_w.mean()
+        self.kl_dim_weights: torch.Tensor | None = (
+            dim_w.view(1, 1, G1_PRED_X_DIM) if self.kl_root_weight != 1.0 else None
+        )
 
         base_diff = pipeline.train_diffusion
         orig_steps = int(base_diff.num_timesteps)
@@ -158,10 +170,17 @@ class StochasticDDIMPolicy:
         mean_base: torch.Tensor,
         std: torch.Tensor,
         valid_mask: torch.Tensor,
+        dim_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Exact closed-form KL(N(mu_p, s^2) || N(mu_b, s^2)) averaged over valid elements -> (B,)."""
+        """Exact closed-form KL(N(mu_p, s^2) || N(mu_b, s^2)) averaged over valid elements -> (B,).
+
+        When ``dim_weights`` (1, 1, D) with mean 1.0 is supplied, up-weights the coupled
+        root trajectory subspace ``[180:189]`` without altering total KL scale or PPO log_probs.
+        """
         var = (std * std).clamp(min=1e-12)
         elem_kl = 0.5 * ((mean_policy.float() - mean_base.float()) ** 2) / var
+        if dim_weights is not None:
+            elem_kl = elem_kl * dim_weights.to(device=elem_kl.device, dtype=elem_kl.dtype)
         mask_f = valid_mask.unsqueeze(-1).to(dtype=elem_kl.dtype)
         denom = (mask_f.sum(dim=(1, 2)) * elem_kl.shape[-1]).clamp(min=1.0)
         return (elem_kl * mask_f).sum(dim=(1, 2)) / denom
@@ -290,7 +309,9 @@ class StochasticDDIMPolicy:
         )
         mean, std = self._ddim_mean_std(x_t, step_idx, pred_x0)
         new_logp = self.gaussian_log_prob(x_prev, mean, std, rollout.valid_mask)
-        kl = self.analytic_gaussian_kl(mean, base_mean, std, rollout.valid_mask)
+        kl = self.analytic_gaussian_kl(
+            mean, base_mean, std, rollout.valid_mask, dim_weights=self.kl_dim_weights
+        )
         return new_logp, kl
 
 
