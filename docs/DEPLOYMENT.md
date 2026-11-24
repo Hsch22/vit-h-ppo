@@ -62,7 +62,7 @@ under `checkpoints/` with full SHA-256 digests in `manifest.json`:
 ```bash
 pip install modelscope
 modelscope download --model Jasonhsc/vit-h-ppo \
-  checkpoints/hard_ppo_decomposed_step1200.pt \
+  checkpoints/hard_ppo_subspace_kl_step1200.pt \
   --local_dir ./inputs/checkpoints/vith_ppo
 ```
 
