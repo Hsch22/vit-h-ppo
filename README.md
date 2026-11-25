@@ -6,10 +6,10 @@ This repository builds on the released ViT-H offline video-to-G1 motion generato
 
 - **Post-training (`post_training/`):** Implemented 8-GPU DDP Diffusion-PPO (`ddpo_single_window` / `ddpo_stitched_window`) with `combined_track`, `decomposed_vel`, `decomposed_vel_root_anchored`, and `stitched_seam` rewards, root-subspace KL anchoring on `[180:189]` (`--kl-root-weight`), hard-example mining, and dual-protocol kinematic + physical evaluation (`post_training/eval_drift_suite.py`).
 - **Default inference (`tools/infer_video.py`):** Defaults to `--overlap 16 --align-mode yaw --blend-mode cosine --sync-mode multidiffusion` (`+0.9%` runtime overhead vs. un-synchronized overlap, zero extra forward passes per step).
-- **Validated gains (`Hard-PPO + Subspace-KL 6× [180:189] step 1200` + MultiDiffusion, deterministic `DDIM-50, eta=0.0`):**
-  - **Root-drift fix (`test` 125 dual-protocol suite: all 16 `h36m` + all 9 `bedlam` + 100 `bedlam2`):** **92.80%** full-sequence `Long` pass rate (`+4/-0` vs. Base `89.60%`, zero regressions; prior uniform-KL `Hard-PPO 1200` had `90.40%`, `+4/-3`), **97.79%** 250-frame `Seg250` pass rate (`+1/-0`), `Zmax` vertical drift reduced below Base (`73.2 mm` vs. Base `74.1 mm` / prior `77.5 mm`), and `H36M` static-cam `Zmax` reduced `-5.6 mm` vs. Base (`144.3` vs. `149.9 mm`).
-  - **Held-out `val` 96 long sequences (`16 h36m + 80 bedlam2`):** **100.00% (16/16)** `H36M` `Long` pass rate (eliminating prior static-cam regressions), **92.41%** overall `Seg250` pass rate, and `Zmax` below Base (`76.9` vs. `78.2 mm`).
-  - **Prior uniform-KL `Hard-PPO step 1200` benchmarks:** **94.13%** on full `test` 392 long seqs (exceeding GT ceiling 93.37%), **90.27%** (`[87.28%, 93.02%]`) on `val` 401 × 3 seeds, **24/24 (100%)** on 8 real-world dance videos × 3 seeds, and external EMDB/RICH **91.04% / 100.0%** `Push Success` (motivating the `[180:189]` subspace-KL fix for static long-horizon drift).
+- **Validated gains (`DDIM-50, eta=0.0` + MultiDiffusion 16-frame yaw stitching):**
+  - **50/50 Model Soup (`hard_ppo_model_soup_50_50_step1200.pt`, linear average of `decomposed_step1200` + `subspace_kl_step1200`, delta cosine `+0.4861`):** Best Pareto balance between dynamic recovery and root-drift control — beats both parents on `val` Hard Bucket A (**8/21 = 38.1%**, **89.06%** overall vs. uniform-KL `7/21` / Subspace-KL `6/21` / Base `6/21`), achieves the lowest `L-MPJPE` (**284.3 mm** vs. Base `297.4` / uniform-KL `287.4` / Subspace-KL `291.1`) and `92.41%` `Seg250` (`+1/-0`) on `val` 96 long sequences, while cutting `W-MPJPE` / `RTE` / `Zmax` drift by **52% / 63% / 71%** vs. uniform-KL (`BEDLAM2 Zmax 77.1 mm < Base 78.2 mm`).
+  - **Root-Subspace KL `6×` (`hard_ppo_subspace_kl_step1200.pt`, `[180:189]`):** **92.80%** Long (`+4/-0` vs. Base `89.60%`, zero regressions) & **97.79%** `Seg250` on held-out `test` 125; **100.00% (16/16)** `H36M` Long on `val` 96; on external EMDB/RICH eliminates **75%–114%** of `W-MPJPE`/`RTE` drift, improves `PA-MPJPE` over Base (`33.524`/`33.544`), recovers RICH `Long Success` to **86.11%** (`31/36`), and achieves the lowest RICH `P95 GRF` (`1.388 BW`) of all 7 compared methods.
+  - **Uniform-KL `Hard-PPO step 1200` (`hard_ppo_decomposed_step1200.pt`):** **94.13%** on full `test` 392 long seqs (exceeding GT ceiling 93.37%), **90.27%** (`[87.28%, 93.02%]`) on `val` 401 × 3 seeds, **24/24 (100%)** on 8 real-world dance videos × 3 seeds, and strongest external `Push Success` (**91.04%** EMDB / **100.0%** RICH).
 
 ## PPO Post-Trained Checkpoints (ModelScope)
 
@@ -23,17 +23,19 @@ Jasonhsc/vit-h-ppo/
 ├── README.md
 ├── manifest.json
 └── checkpoints/
-    ├── hard_ppo_subspace_kl_step1200.pt   # Recommended default (Subspace-KL 6x [180:189], zero test regressions)
-    ├── hard_ppo_decomposed_step1200.pt    # Prior uniform-KL Hard-PPO (step 1200)
-    ├── hard_ppo_decomposed_step0900.pt    # Short-window / hard-case (Bucket A)
-    ├── pilot_uniform_step0500.pt          # Ablation: uniform-sampling PPO (500 steps)
-    └── stitched_seam_step0800.pt          # Ablation: dual-window stitched-seam PPO (+800 steps)
+    ├── hard_ppo_model_soup_50_50_step1200.pt  # Recommended default (50/50 Model Soup of uniform-KL + Subspace-KL 6x)
+    ├── hard_ppo_subspace_kl_step1200.pt       # Subspace-KL 6x [180:189] (lowest drift & RICH P95 GRF)
+    ├── hard_ppo_decomposed_step1200.pt        # Uniform-KL Hard-PPO step 1200 (strongest Push Success)
+    ├── hard_ppo_decomposed_step0900.pt        # Short-window / hard-case (Bucket A)
+    ├── pilot_uniform_step0500.pt              # Ablation: uniform-sampling PPO (500 steps)
+    └── stitched_seam_step0800.pt              # Ablation: dual-window stitched-seam PPO (+800 steps)
 ```
 
 | Checkpoint Path | Method | Step | Size | SHA-256 (prefix) | Recommended For |
 | --- | --- | ---: | ---: | --- | --- |
-| **`checkpoints/hard_ppo_subspace_kl_step1200.pt`** | Hard-PPO + Subspace-KL `6×` `[180:189]` | 1200 | 898.86 MB | `864329b22dfb2aa8` | **Default** — zero Z-drift / zero `test` regressions (`92.80%` Long `+4/-0`, `97.79%` Seg250, `100%` val H36M) |
-| `checkpoints/hard_ppo_decomposed_step1200.pt` | Hard-PPO (`decomposed_vel`, uniform KL) | 1200 | 898.86 MB | `c49cd815796bafd4` | Prior uniform-KL baseline (`94.13%` test 392, `91.04%` EMDB / `100%` RICH Push) |
+| **`checkpoints/hard_ppo_model_soup_50_50_step1200.pt`** | 50/50 Model Soup (`decomposed_1200` + `subspace_kl_1200`) | 1200 | 898.85 MB | `1c2e2ca4b4149739` | **Default** — best Pareto balance (`val` Bucket A `8/21`, `L-MPJPE 284.3 mm`, `Seg250 92.41%`, 52%–71% lower drift vs uniform-KL) |
+| `checkpoints/hard_ppo_subspace_kl_step1200.pt` | Hard-PPO + Subspace-KL `6×` `[180:189]` | 1200 | 898.86 MB | `864329b22dfb2aa8` | Strictest global-drift & GRF control (`test` 125 `92.80% +4/-0`, EMDB/RICH drift -75% to -114%, RICH P95 GRF `1.388 BW`) |
+| `checkpoints/hard_ppo_decomposed_step1200.pt` | Hard-PPO (`decomposed_vel`, uniform KL) | 1200 | 898.86 MB | `c49cd815796bafd4` | Maximum external push robustness (`94.13%` test 392, `91.04%` EMDB / `100%` RICH Push) |
 | `checkpoints/hard_ppo_decomposed_step0900.pt` | Hard-PPO (`decomposed_vel`, uniform KL) | 900 | 898.86 MB | `a0c5e44cfa16d177` | Short-window / high-dynamic hard cases (`Bucket A 7/22`, `Bucket B 0.1591 m`) |
 | `checkpoints/pilot_uniform_step0500.pt` | Pilot Uniform PPO (`combined_track`) | 500 | 898.86 MB | `3f27f94248e26157` | Uniform-sampling ablation |
 | `checkpoints/stitched_seam_step0800.pt` | Stitched-Seam PPO (`stitched_seam`) | 800 | 898.86 MB | `e5f48331c8e5c6f7` | Dual-window seam-reward ablation |
@@ -43,9 +45,9 @@ Download the recommended checkpoint (or all checkpoints) into the gitignored `in
 ```bash
 pip install modelscope
 
-# Download only the recommended checkpoint
+# Download only the recommended Model Soup checkpoint
 modelscope download --model Jasonhsc/vit-h-ppo \
-  checkpoints/hard_ppo_subspace_kl_step1200.pt \
+  checkpoints/hard_ppo_model_soup_50_50_step1200.pt \
   --local_dir ./inputs/checkpoints/vith_ppo
 
 # Or download the full checkpoint repo via Python SDK
@@ -57,7 +59,7 @@ Run long-horizon inference with the downloaded PPO checkpoint (MultiDiffusion 16
 ```bash
 python tools/infer_video.py \
   --video /path/to/input.mp4 \
-  --ckpt inputs/checkpoints/vith_ppo/checkpoints/hard_ppo_subspace_kl_step1200.pt \
+  --ckpt inputs/checkpoints/vith_ppo/checkpoints/hard_ppo_model_soup_50_50_step1200.pt \
   --sam3d-root third-party/Fast-SAM-3D-Body \
   --sam3d-ckpt-path third-party/Fast-SAM-3D-Body/checkpoints/sam-3d-body-dinov3/model.ckpt \
   --sam3d-mhr-path third-party/Fast-SAM-3D-Body/checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt \
